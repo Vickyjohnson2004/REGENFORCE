@@ -23,44 +23,73 @@ import {
  * links to each action. Structure is stable HTML (no API).
  */
 
-const OCC_PRESS_INDEX = "https://www.occ.gov/news-issuances/news-releases/";
+/**
+ * Primary source. The OCC publishes all enforcement actions (civil money
+ * penalties, cease-and-desist orders, formal agreements, and PCA directives)
+ * as press releases under /news-issuances/news-releases/. We also try the
+ * year-indexed enforcement page as a backup.
+ */
+const OCC_INDEXES = [
+  "https://www.occ.gov/news-issuances/news-releases/",
+  "https://www.occ.gov/news-issuances/news-releases/2026/index.html",
+  "https://www.occ.gov/news-issuances/news-releases/2025/index.html",
+];
+const OCC_PRIMARY_INDEX = OCC_INDEXES[0] ?? "https://www.occ.gov/";
 
 export class OCCAdapter implements AgencyAdapter {
   readonly agency = "OCC" as const;
+  readonly runTimeoutMs = 45_000;
 
   async fetchRecent(): Promise<AdapterRunResult> {
     const errors: AdapterRunResult["errors"] = [];
-    let html: string;
-    try {
-      html = await fetchText(OCC_PRESS_INDEX, 20_000);
-    } catch (err) {
-      errors.push({
-        message: `OCC press-index fetch failed: ${err instanceof Error ? err.message : String(err)}`,
-        hint: `Verify ${OCC_PRESS_INDEX} is still the canonical press-release index.`,
-      });
-      return { agency: "OCC", sourceUrl: OCC_PRESS_INDEX, actions: [], errors };
+    const htmls: Array<{ html: string; url: string }> = [];
+
+    for (const url of OCC_INDEXES) {
+      try {
+        const html = await fetchText(url, 20_000);
+        htmls.push({ html, url });
+      } catch (err) {
+        errors.push({
+          message: `OCC fetch failed for ${url}: ${err instanceof Error ? err.message : String(err)}`,
+        });
+      }
     }
 
-    const $ = cheerio.load(html);
-    const candidates: Array<{ title: string; href: string; date: string | undefined }> = [];
+    if (htmls.length === 0) {
+      errors.push({
+        message: "OCC: every index URL failed",
+        hint: `Primary: ${OCC_PRIMARY_INDEX}. If fetches time out, OCC may be blocking this outbound IP range; retry from a different deployment region.`,
+      });
+      return { agency: "OCC", sourceUrl: OCC_PRIMARY_INDEX, actions: [], errors };
+    }
 
-    // OCC uses article-style listings in recent designs. We also support a
-    // simpler <li><a>title</a> — date</li> layout as a fallback.
-    $("a").each((_, el) => {
-      const title = $(el).text().trim();
-      const href = $(el).attr("href");
-      if (!title || !href) return;
-      if (!/news-releases\/\d{4}/.test(href)) return;
-      if (!isOccEnforcement(title)) return;
-      const full = href.startsWith("http") ? href : `https://www.occ.gov${href}`;
-      const dateText = $(el).closest("li, article, tr").find("time, .date").first().text().trim();
-      candidates.push({ title, href: full, date: dateText || undefined });
-    });
+    const candidates: Array<{ title: string; href: string; date: string | undefined }> = [];
+    const seen = new Set<string>();
+    for (const { html } of htmls) {
+      const $ = cheerio.load(html);
+      $("a").each((_, el) => {
+        const title = $(el).text().trim();
+        const href = $(el).attr("href");
+        if (!title || !href) return;
+        if (!/news-releases\/\d{4}/.test(href)) return;
+        if (!isOccEnforcement(title)) return;
+        const full = href.startsWith("http") ? href : `https://www.occ.gov${href}`;
+        if (seen.has(full)) return;
+        seen.add(full);
+        const dateText = $(el)
+          .closest("li, article, tr, .news-release-row")
+          .find("time, .date, .news-release-date")
+          .first()
+          .text()
+          .trim();
+        candidates.push({ title, href: full, date: dateText || undefined });
+      });
+    }
 
     if (candidates.length === 0) {
       errors.push({
         message: "OCC press index yielded no enforcement-related rows",
-        hint: `OCC may have changed the enforcement listing layout. Inspect ${OCC_PRESS_INDEX} and update selectors in src/adapters/occ.ts.`,
+        hint: `OCC may have changed the enforcement listing layout. Inspect ${OCC_PRIMARY_INDEX} and update selectors in src/adapters/occ.ts.`,
       });
     }
 
@@ -75,7 +104,7 @@ export class OCCAdapter implements AgencyAdapter {
 
       const provenance: Provenance = {
         source: "OCC-news-releases-index",
-        sourceUrl: OCC_PRESS_INDEX,
+        sourceUrl: OCC_PRIMARY_INDEX,
         fetchedAt: new Date().toISOString(),
         fieldOrigin: {
           agency: "observed",
@@ -111,7 +140,7 @@ export class OCCAdapter implements AgencyAdapter {
       });
     }
 
-    return { agency: "OCC", sourceUrl: OCC_PRESS_INDEX, actions, errors };
+    return { agency: "OCC", sourceUrl: OCC_PRIMARY_INDEX, actions, errors };
   }
 }
 

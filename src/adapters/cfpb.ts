@@ -1,3 +1,4 @@
+import * as cheerio from "cheerio";
 import type {
   NormalizedAction,
   Provenance,
@@ -12,39 +13,50 @@ import {
 import { normalizeEntityKey } from "../normalization/entities.js";
 import {
   fetchJson,
+  fetchText,
   type AdapterRunResult,
   type AgencyAdapter,
 } from "./base.js";
 
 /**
- * CFPB adapter: pulls from the CFPB enforcement-actions dataset on
- * data.consumerfinance.gov (Socrata).
+ * CFPB adapter.
  *
- * Dataset: "Enforcement Actions"
- *   https://data.consumerfinance.gov/resource/y6mt-r5kq.json
- *
- * The CFPB also publishes actions as an HTML + CSV list at
+ * CFPB retired its public Socrata enforcement-actions dataset sometime in
+ * 2025. The canonical public source is now the HTML listing at
  *   https://www.consumerfinance.gov/enforcement/actions/
- * but the Socrata resource is the stable, structured API.
+ * which paginates all public enforcement actions back to 2012. Each row
+ * carries the respondent, filing date, action type, and links to a detail
+ * page with the full press release and order PDF.
+ *
+ * We parse the HTML listing by default and fall back to any Socrata dataset
+ * that still responds — multiple dataset IDs have been used historically.
  */
 
-const SOCRATA_URL =
-  "https://data.consumerfinance.gov/resource/sjn8-e27p.json?$limit=500&$order=final_disposition_date%20DESC";
+const HTML_INDEX = "https://www.consumerfinance.gov/enforcement/actions/";
+const HTML_INDEX_PAGES = [
+  "https://www.consumerfinance.gov/enforcement/actions/",
+  "https://www.consumerfinance.gov/enforcement/actions/?page=2",
+  "https://www.consumerfinance.gov/enforcement/actions/?page=3",
+];
 
-interface CfpbRow {
+// Candidate Socrata dataset IDs we've seen over time. We try them in order;
+// any that return a JSON array are used. If all fail we fall back to HTML.
+const SOCRATA_CANDIDATES = [
+  "https://data.consumerfinance.gov/resource/sjn8-e27p.json?$limit=500",
+  "https://data.consumerfinance.gov/resource/y6mt-r5kq.json?$limit=500",
+  "https://data.consumerfinance.gov/resource/jdvk-qcwc.json?$limit=500",
+];
+
+interface SocrataRow {
   case_id?: string;
   name?: string;
   respondent?: string;
-  respondents?: string;
-  docket_number?: string;
   institution?: string;
-  court?: string;
+  docket_number?: string;
   status?: string;
   final_disposition?: string;
   action?: string;
   action_type?: string;
-  product?: string;
-  court_name?: string;
   final_disposition_date?: string;
   date?: string;
   civil_money_penalty_amount?: string;
@@ -59,35 +71,68 @@ interface CfpbRow {
 
 export class CFPBAdapter implements AgencyAdapter {
   readonly agency = "CFPB" as const;
+  readonly runTimeoutMs = 60_000;
 
   async fetchRecent(): Promise<AdapterRunResult> {
     const errors: AdapterRunResult["errors"] = [];
-    let rows: CfpbRow[] = [];
-    try {
-      rows = await fetchJson<CfpbRow[]>(SOCRATA_URL, { timeoutMs: 20_000 });
-    } catch (err) {
-      errors.push({
-        message: err instanceof Error ? err.message : String(err),
-        hint:
-          `CFPB Socrata endpoint (${SOCRATA_URL}) failed. If the dataset was renamed, update SOCRATA_URL. Public mirror: https://www.consumerfinance.gov/enforcement/actions/`,
-      });
-      return { agency: "CFPB", sourceUrl: SOCRATA_URL, actions: [], errors };
+
+    // --- Try Socrata first (if any candidate is alive, it is much richer). ---
+    for (const url of SOCRATA_CANDIDATES) {
+      try {
+        const rows = await fetchJson<SocrataRow[]>(url, { timeoutMs: 15_000 });
+        if (Array.isArray(rows) && rows.length > 0) {
+          const actions = rows
+            .map((r) => this.normalizeSocrataRow(r, url))
+            .filter((a): a is NormalizedAction => Boolean(a));
+          if (actions.length > 0) {
+            return { agency: "CFPB", sourceUrl: url, actions, errors };
+          }
+        }
+      } catch (err) {
+        errors.push({
+          message: `CFPB Socrata ${url}: ${err instanceof Error ? err.message : String(err)}`,
+          hint: "CFPB has retired multiple Socrata datasets; falling back to HTML listing.",
+        });
+      }
     }
 
-    if (!Array.isArray(rows)) {
-      errors.push({ message: "CFPB Socrata returned non-array payload", hint: SOCRATA_URL });
-      return { agency: "CFPB", sourceUrl: SOCRATA_URL, actions: [], errors };
-    }
-
+    // --- HTML listing fallback. ---
     const actions: NormalizedAction[] = [];
-    for (const row of rows) {
-      const built = this.normalizeRow(row);
-      if (built) actions.push(built);
+    const seen = new Set<string>();
+    for (const page of HTML_INDEX_PAGES) {
+      try {
+        const html = await fetchText(page, 20_000);
+        const parsed = parseHtmlListing(html, page);
+        for (const a of parsed) {
+          if (!seen.has(a.actionId)) {
+            seen.add(a.actionId);
+            actions.push(a);
+          }
+        }
+      } catch (err) {
+        errors.push({
+          message: `CFPB HTML fetch failed: ${err instanceof Error ? err.message : String(err)}`,
+          hint: `URL: ${page}. If this URL is being blocked at the edge, verify outbound IP reputation; the listing is public.`,
+        });
+      }
     }
-    return { agency: "CFPB", sourceUrl: SOCRATA_URL, actions, errors };
+
+    if (actions.length === 0 && errors.length === 0) {
+      errors.push({
+        message: "CFPB HTML listing yielded no rows",
+        hint: `CFPB may have redesigned ${HTML_INDEX}; update selectors in src/adapters/cfpb.ts.`,
+      });
+    }
+
+    return {
+      agency: "CFPB",
+      sourceUrl: HTML_INDEX,
+      actions,
+      errors,
+    };
   }
 
-  private normalizeRow(row: CfpbRow): NormalizedAction | null {
+  private normalizeSocrataRow(row: SocrataRow, sourceUrl: string): NormalizedAction | null {
     const respondent = row.respondent ?? row.name ?? row.institution ?? undefined;
     if (!respondent) return null;
 
@@ -98,8 +143,7 @@ export class CFPBAdapter implements AgencyAdapter {
     const actionId = `CFPB:${sanitizeId(id)}`;
 
     const date = normalizeDate(row.final_disposition_date ?? row.date);
-    const rawActionType =
-      row.action_type ?? row.action ?? row.final_disposition ?? undefined;
+    const rawActionType = row.action_type ?? row.action ?? row.final_disposition ?? undefined;
     const actionType = classifyActionType("CFPB", rawActionType, [
       respondent,
       row.summary ?? "",
@@ -131,18 +175,17 @@ export class CFPBAdapter implements AgencyAdapter {
       if (extracted.breakdown) breakdown.push(...extracted.breakdown);
     }
 
-    const documentUrl =
-      row.document_url ?? row.press_release_url ?? row.url ?? undefined;
+    const documentUrl = row.document_url ?? row.press_release_url ?? row.url ?? undefined;
 
     const provenance: Provenance = {
-      source: "CFPB-Socrata-sjn8-e27p",
-      sourceUrl: SOCRATA_URL,
+      source: "CFPB-Socrata",
+      sourceUrl,
       fetchedAt: new Date().toISOString(),
       fieldOrigin: {
         agency: "observed",
         actionId: "observed",
         actionType: "normalized",
-        rawActionType: "observed",
+        rawActionType: rawActionType ? "observed" : "unknown",
         status: "normalized",
         respondent: "observed",
         actionDate: "normalized",
@@ -166,7 +209,7 @@ export class CFPBAdapter implements AgencyAdapter {
       penaltyAmount: amount,
       penaltyCurrency: "USD",
       penaltyBreakdown: breakdown.length > 0 ? breakdown : undefined,
-      allegations: row.summary ?? row.product,
+      allegations: row.summary,
       title: row.name ?? respondent,
       summary: row.summary,
       documentUrl,
@@ -177,6 +220,111 @@ export class CFPBAdapter implements AgencyAdapter {
   }
 }
 
+/**
+ * Parse the /enforcement/actions/ HTML listing. Each action on the listing is
+ * rendered as a card/article with:
+ *   - Respondent name + detail-page link (primary anchor)
+ *   - Status tag (e.g. "Judgment entered", "Pending litigation")
+ *   - Date filed
+ *   - Optional description paragraph
+ */
+function parseHtmlListing(html: string, sourceUrl: string): NormalizedAction[] {
+  const $ = cheerio.load(html);
+  const actions: NormalizedAction[] = [];
+
+  // CFPB uses both .m-list_item and article-style cards. We accept either.
+  const rowSelector = [
+    "article.o-post-preview",
+    "li.m-list_item",
+    "article",
+    ".o-post-preview",
+    ".m-list_item",
+    ".a-post-preview",
+  ].join(", ");
+
+  $(rowSelector).each((_, el) => {
+    const $el = $(el);
+    const primary = $el.find("a").filter((_, a) => {
+      const href = $(a).attr("href") ?? "";
+      return /\/enforcement\/actions\/[\w-]+\/?$/.test(href);
+    }).first();
+
+    const href = primary.attr("href") ?? "";
+    if (!href) return;
+    const detailUrl = href.startsWith("http") ? href : `https://www.consumerfinance.gov${href}`;
+    const respondent = primary.text().replace(/\s+/g, " ").trim();
+    if (!respondent || respondent.length < 2) return;
+
+    // Pull visible text for date/status/summary extraction.
+    const fullText = $el.text().replace(/\s+/g, " ").trim();
+
+    // Common patterns: "Date filed: 2024-10-15" / "Oct 15, 2024 · Civil penalty"
+    const dateText =
+      $el.find("time").attr("datetime") ||
+      $el.find("time").first().text().trim() ||
+      (/\b(\d{4}-\d{2}-\d{2})\b/.exec(fullText)?.[1]) ||
+      (/\b((?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2},?\s+\d{4})\b/i.exec(fullText)?.[1]);
+    const date = normalizeDate(dateText);
+
+    const statusTag =
+      $el.find(".a-tag, .tag, .status, .u-right").first().text().trim() ||
+      (/\b(Pending|Settled|Judgment|Dismissed|Final order|Default judgment)\b/i.exec(fullText)?.[1] ??
+        "");
+    const rawStatus = statusTag || undefined;
+    const status = classifyStatus([rawStatus ?? "", respondent, fullText]);
+
+    const summary = $el.find("p").first().text().replace(/\s+/g, " ").trim();
+    const actionType = classifyActionType("CFPB", rawStatus, [respondent, summary, fullText]);
+    const penalty = extractPenalty(`${respondent} ${summary} ${fullText}`);
+
+    const actionId = `CFPB:${sanitizeId(detailUrl.replace("https://www.consumerfinance.gov", ""))}`;
+
+    const provenance: Provenance = {
+      source: "CFPB-html-listing",
+      sourceUrl,
+      fetchedAt: new Date().toISOString(),
+      fieldOrigin: {
+        agency: "observed",
+        actionId: "observed",
+        actionType: "normalized",
+        rawActionType: rawStatus ? "observed" : "unknown",
+        status: "normalized",
+        rawStatus: rawStatus ? "observed" : "unknown",
+        respondent: "observed",
+        actionDate: date ? "observed" : "unknown",
+        title: "observed",
+        summary: summary ? "observed" : "unknown",
+        documentUrl: "observed",
+        penaltyAmount: penalty.origin,
+      },
+    };
+
+    actions.push({
+      actionId,
+      agency: "CFPB",
+      actionType,
+      rawActionType: rawStatus,
+      status,
+      rawStatus,
+      actionDate: date,
+      respondent,
+      respondents: [respondent],
+      penaltyAmount: penalty.amount,
+      penaltyCurrency: "USD",
+      penaltyBreakdown: penalty.breakdown,
+      title: respondent,
+      summary: summary || undefined,
+      allegations: summary || undefined,
+      documentUrl: detailUrl,
+      entityKey: normalizeEntityKey(respondent),
+      provenance,
+      rawPayload: { respondent, summary, fullText, detailUrl, dateText, rawStatus },
+    });
+  });
+
+  return actions;
+}
+
 function sanitizeId(s: string): string {
-  return s.replace(/[^A-Za-z0-9._-]+/g, "-").slice(0, 120);
+  return s.replace(/[^A-Za-z0-9._-]+/g, "-").slice(0, 160);
 }

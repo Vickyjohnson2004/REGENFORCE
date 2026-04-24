@@ -24,6 +24,10 @@ import { dispatchTool } from "./mcp/handlers.js";
 import { AGENCIES, type Agency } from "./types.js";
 import { runAgency, runAllAdapters } from "./ingest/runner.js";
 import {
+  getAgencyCoverage,
+  getLastIngestionRun,
+} from "./db/repository.js";
+import {
   runOnStartupIfConfigured,
   startIngestionScheduler,
 } from "./ingest/scheduler.js";
@@ -115,9 +119,57 @@ app.get("/", (_req: Request, res: Response) => {
       "Cross-agency financial regulatory enforcement intelligence (SEC, CFPB, FTC, FINRA, FinCEN, OCC).",
     mcpEndpoint: "/mcp",
     health: "/health",
+    stats: "/stats",
     tools: TOOLS.map((t) => t.name),
     version: config.version,
   });
+});
+
+// ---------------------------------------------------------------------------
+// Public /stats — read-only aggregate DB state (no PII, no raw records).
+//
+// Publicly exposes per-agency action counts, earliest/latest dates, and the
+// status + timestamp of the last ingestion run. Serves two purposes:
+//   1. Operators can verify the ingestion pipeline is actually running.
+//   2. Marketplace reviewers can confirm data integrity before approval
+//      (counts here must match `get_agency_coverage` tool output).
+// ---------------------------------------------------------------------------
+app.get("/stats", async (_req: Request, res: Response) => {
+  try {
+    const coverage = await getAgencyCoverage();
+    const perAgency = await Promise.all(
+      AGENCIES.map(async (agency) => {
+        const row = coverage.find((c) => c.agency === agency) ?? null;
+        const lastRun = await getLastIngestionRun(agency);
+        return {
+          agency,
+          totalActions: row?.totalActions ?? 0,
+          earliestAction: row?.earliestAction ?? null,
+          latestAction: row?.latestAction ?? null,
+          lastIngestedAt: row?.lastIngestedAt ?? lastRun?.completedAt ?? null,
+          lastIngestStatus: lastRun?.status ?? null,
+          lastIngestError: lastRun?.errorMessage ?? null,
+          lastIngestInserted: lastRun?.actionsIngested ?? null,
+          lastIngestUpdated: lastRun?.actionsUpdated ?? null,
+        };
+      }),
+    );
+    const totalActions = perAgency.reduce((acc, a) => acc + a.totalActions, 0);
+    res.json({
+      server: config.serverName,
+      version: config.version,
+      totalActions,
+      agenciesCovered: perAgency.filter((a) => a.totalActions > 0).map((a) => a.agency),
+      perAgency,
+      generatedAt: new Date().toISOString(),
+    });
+  } catch (err) {
+    logger.error({ err }, "/stats failed");
+    res.status(500).json({
+      error: "stats_unavailable",
+      message: err instanceof Error ? err.message : String(err),
+    });
+  }
 });
 
 // ---------------------------------------------------------------------------

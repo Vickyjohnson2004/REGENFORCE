@@ -1,3 +1,4 @@
+import * as cheerio from "cheerio";
 import type {
   NormalizedAction,
   Provenance,
@@ -18,20 +19,27 @@ import {
   type AdapterRunResult,
   type AgencyAdapter,
 } from "./base.js";
-import { XMLParser } from "fast-xml-parser";
 
 /**
- * FTC adapter: Uses the official FTC public data API when DATA_GOV_API_KEY
- * is configured; falls back to the FTC press-releases RSS feed when it isn't.
+ * FTC adapter.
  *
- * API docs: https://www.ftc.gov/developer/api
- * Cases & proceedings: https://www.ftc.gov/legal-library/browse/cases-proceedings
- *
- * The FTC's JSON endpoint paths have been renamed in the past. We try a few
- * known patterns and gracefully degrade when all fail.
+ * Preference order:
+ *   1. Official FTC data.gov API (requires a free DATA_GOV_API_KEY). Endpoints
+ *      for nonmerger / merger / civil-penalty actions live at
+ *      https://api.data.gov/ftc/v0/*
+ *      Documented at https://github.com/FederalTradeCommission/ftc-api-docs
+ *   2. HTML scrape of https://www.ftc.gov/news-events/news/press-releases
+ *      which lists ~50 recent press releases in a structured views-row grid.
+ *      FTC's legacy RSS feed (press-release.xml) now 403s on most crawlers.
  */
 
-const RSS_FEED = "https://www.ftc.gov/feeds/press-release.xml";
+const FTC_PRESS_PAGE_BASE =
+  "https://www.ftc.gov/news-events/news/press-releases?items_per_page=50";
+const FTC_PRESS_PAGES = [
+  FTC_PRESS_PAGE_BASE,
+  `${FTC_PRESS_PAGE_BASE}&page=1`,
+  `${FTC_PRESS_PAGE_BASE}&page=2`,
+];
 const DATA_GOV_BASE = "https://api.data.gov/ftc/v0";
 
 interface FtcCase {
@@ -59,6 +67,7 @@ interface DataGovResponse<T> {
 
 export class FTCAdapter implements AgencyAdapter {
   readonly agency = "FTC" as const;
+  readonly runTimeoutMs = 60_000;
 
   async fetchRecent(): Promise<AdapterRunResult> {
     const errors: AdapterRunResult["errors"] = [];
@@ -66,14 +75,10 @@ export class FTCAdapter implements AgencyAdapter {
     if (config.dataGovApiKey) {
       const apiResult = await this.tryDataGov(errors);
       if (apiResult.actions.length > 0) return apiResult;
-    } else {
-      errors.push({
-        message: "DATA_GOV_API_KEY not set; falling back to FTC press-release RSS feed",
-        hint: "Request a free key at https://api.data.gov/signup/",
-      });
     }
 
-    return this.rssFallback(errors);
+    // HTML scrape of the public press-releases listing.
+    return this.scrapePressPages(errors);
   }
 
   private async tryDataGov(errors: AdapterRunResult["errors"]): Promise<AdapterRunResult> {
@@ -102,7 +107,7 @@ export class FTCAdapter implements AgencyAdapter {
       } catch (err) {
         errors.push({
           message: `FTC API ${endpoint}: ${err instanceof Error ? err.message : String(err)}`,
-          hint: `Endpoint ${url} failed. Data.gov endpoint paths shift occasionally; see https://github.com/FederalTradeCommission/ftc-api-docs for current list.`,
+          hint: `Endpoint ${url} failed. data.gov endpoint paths shift occasionally; see https://github.com/FederalTradeCommission/ftc-api-docs for the current list.`,
         });
       }
     }
@@ -115,78 +120,41 @@ export class FTCAdapter implements AgencyAdapter {
     };
   }
 
-  private async rssFallback(errors: AdapterRunResult["errors"]): Promise<AdapterRunResult> {
-    try {
-      const xml = await fetchText(RSS_FEED, 15_000);
-      const parser = new XMLParser({
-        ignoreAttributes: false,
-        trimValues: true,
-        parseTagValue: false,
-      });
-      const doc = parser.parse(xml);
-      const items: Array<Record<string, unknown>> = toArr(doc?.rss?.channel?.item);
-      const actions: NormalizedAction[] = [];
-      for (const item of items) {
-        const title = asStr(item.title);
-        const description = asStr(item.description);
-        const link = asStr(item.link);
-        const pub = asStr(item.pubDate);
-        const guid = asStr(item.guid);
-        if (!title || !link) continue;
-        if (!isFtcEnforcement(title, description)) continue;
+  private async scrapePressPages(errors: AdapterRunResult["errors"]): Promise<AdapterRunResult> {
+    const actions: NormalizedAction[] = [];
+    const seen = new Set<string>();
 
-        const respondent = extractFtcRespondent(title, description);
-        const actionType = classifyActionType("FTC", undefined, [title, description ?? ""]);
-        const status = classifyStatus([title, description ?? ""]);
-        const penalty = extractPenalty(combineText(title, description));
-        const actionId = `FTC:${sanitizeId(guid ?? link ?? title)}`;
-
-        const provenance: Provenance = {
-          source: "FTC-press-release-rss",
-          sourceUrl: RSS_FEED,
-          fetchedAt: new Date().toISOString(),
-          fieldOrigin: {
-            agency: "observed",
-            actionId: "observed",
-            actionType: "normalized",
-            status: "normalized",
-            respondent: "normalized",
-            actionDate: "normalized",
-            title: "observed",
-            summary: "observed",
-            documentUrl: "observed",
-            penaltyAmount: penalty.origin,
-          },
-        };
-
-        actions.push({
-          actionId,
-          agency: "FTC",
-          actionType,
-          status,
-          actionDate: normalizeDate(pub),
-          respondent,
-          respondents: [respondent],
-          penaltyAmount: penalty.amount,
-          penaltyCurrency: "USD",
-          penaltyBreakdown: penalty.breakdown,
-          allegations: description,
-          title,
-          summary: description,
-          documentUrl: link,
-          entityKey: normalizeEntityKey(respondent),
-          provenance,
-          rawPayload: { title, description, link, pubDate: pub },
+    for (const page of FTC_PRESS_PAGES) {
+      try {
+        const html = await fetchText(page, 20_000);
+        const parsed = parseFtcListing(html, page);
+        for (const a of parsed) {
+          if (!seen.has(a.actionId)) {
+            seen.add(a.actionId);
+            actions.push(a);
+          }
+        }
+      } catch (err) {
+        errors.push({
+          message: `FTC press-release page fetch failed: ${err instanceof Error ? err.message : String(err)}`,
+          hint: `URL: ${page}. Verify in browser.`,
         });
       }
-      return { agency: "FTC", sourceUrl: RSS_FEED, actions, errors };
-    } catch (err) {
-      errors.push({
-        message: `FTC RSS fetch failed: ${err instanceof Error ? err.message : String(err)}`,
-        hint: `Verify ${RSS_FEED} is still the canonical feed.`,
-      });
-      return { agency: "FTC", sourceUrl: RSS_FEED, actions: [], errors };
     }
+
+    if (actions.length === 0 && errors.length === 0) {
+      errors.push({
+        message: "FTC press-release listing yielded no enforcement rows",
+        hint: `Selectors or enforcement-signal filter may need updating in src/adapters/ftc.ts.`,
+      });
+    }
+
+    return {
+      agency: "FTC",
+      sourceUrl: FTC_PRESS_PAGE_BASE,
+      actions,
+      errors,
+    };
   }
 
   private normalizeCase(row: FtcCase, source: string, sourceUrl: string): NormalizedAction | null {
@@ -257,46 +225,130 @@ export class FTCAdapter implements AgencyAdapter {
   }
 }
 
-function asStr(v: unknown): string | undefined {
-  if (typeof v === "string") return v;
-  if (v && typeof v === "object" && "#text" in v && typeof (v as Record<string, unknown>)["#text"] === "string") {
-    return (v as Record<string, unknown>)["#text"] as string;
-  }
-  return undefined;
+/**
+ * Parse the FTC press-releases listing. Each row is a `<div class="views-row">`
+ * containing a `<h3><a href="...">title</a></h3>`, date, and summary paragraph.
+ */
+function parseFtcListing(html: string, sourceUrl: string): NormalizedAction[] {
+  const $ = cheerio.load(html);
+  const actions: NormalizedAction[] = [];
+
+  $(".views-row").each((_, el) => {
+    const $el = $(el);
+    const anchor = $el
+      .find("a")
+      .filter((_, a) => {
+        const href = $(a).attr("href") ?? "";
+        return /\/news-events\/news\/press-releases\/\d{4}\//.test(href);
+      })
+      .first();
+    const href = anchor.attr("href") ?? "";
+    const title = anchor.text().replace(/\s+/g, " ").trim();
+    if (!title || !href) return;
+    if (!isFtcEnforcement(title, "")) return;
+
+    const url = href.startsWith("http") ? href : `https://www.ftc.gov${href}`;
+    const dateText =
+      $el.find("time").attr("datetime") ||
+      $el.find("time").first().text().trim() ||
+      inferDateFromUrl(href);
+    const date = normalizeDate(dateText);
+
+    const summary = $el.find("p").first().text().replace(/\s+/g, " ").trim();
+    const body = combineText(title, summary);
+    const actionType = classifyActionType("FTC", undefined, [title, summary]);
+    const status = classifyStatus([title, summary]);
+    const penalty = extractPenalty(body);
+    const respondent = extractFtcRespondent(title, summary);
+
+    const actionId = `FTC:${sanitizeId(href)}`;
+    const provenance: Provenance = {
+      source: "FTC-press-release-listing",
+      sourceUrl,
+      fetchedAt: new Date().toISOString(),
+      fieldOrigin: {
+        agency: "observed",
+        actionId: "observed",
+        actionType: "normalized",
+        status: "normalized",
+        respondent: "inferred",
+        actionDate: date ? "observed" : "unknown",
+        title: "observed",
+        summary: summary ? "observed" : "unknown",
+        documentUrl: "observed",
+        penaltyAmount: penalty.origin,
+      },
+    };
+
+    actions.push({
+      actionId,
+      agency: "FTC",
+      actionType,
+      status,
+      actionDate: date,
+      respondent,
+      respondents: [respondent],
+      penaltyAmount: penalty.amount,
+      penaltyCurrency: "USD",
+      penaltyBreakdown: penalty.breakdown,
+      title,
+      summary: summary || undefined,
+      allegations: summary || undefined,
+      documentUrl: url,
+      entityKey: normalizeEntityKey(respondent),
+      provenance,
+      rawPayload: { title, summary, href },
+    });
+  });
+
+  return actions;
 }
 
-function toArr<T>(v: unknown): T[] {
-  if (Array.isArray(v)) return v as T[];
-  if (v === undefined || v === null) return [];
-  return [v as T];
-}
-
-function isFtcEnforcement(title: string, description: string | undefined): boolean {
-  const text = `${title} ${description ?? ""}`.toLowerCase();
+function isFtcEnforcement(title: string, description: string): boolean {
+  const text = `${title} ${description}`.toLowerCase();
   return (
+    text.includes("ftc sues") ||
+    text.includes("ftc takes action") ||
+    text.includes("ftc charges") ||
+    text.includes("ftc files") ||
+    text.includes("court orders") ||
     text.includes("settlement") ||
     text.includes("complaint") ||
     text.includes("enforcement") ||
-    text.includes("action") ||
-    text.includes("order") ||
     text.includes("penalty") ||
     text.includes("violation") ||
-    text.includes("charge")
+    text.includes("refund") ||
+    text.includes("ftc stops") ||
+    text.includes("ftc order") ||
+    text.includes("consent order") ||
+    text.includes("deceptive") ||
+    /ftc\s+and\s+[A-Z]/.test(text)
   );
 }
 
 function extractFtcRespondent(title: string, description: string | undefined): string {
-  const m = /(?:FTC|Federal Trade Commission)[^:]*(?:sues|orders|charges|takes action against|files\s+complaint\s+against|settles\s+with|reaches\s+settlement\s+with)\s+([^,;:.]+)/i.exec(
-    title,
-  );
-  if (m?.[1]) return m[1].replace(/\s+/g, " ").trim();
+  const patterns = [
+    /(?:FTC|Federal Trade Commission)[^:]*(?:sues|orders|charges|takes action against|files\s+complaint\s+against|settles\s+with|reaches\s+settlement\s+with|stops)\s+([^,;:.]+?)(?:\s+for|\s+over|,|$)/i,
+    /Court\s+Orders?\s+([A-Z][^,;:]+?)\s+(?:to\s+Pay|to\s+Cease)/i,
+    /^([A-Z][A-Za-z0-9 &'.,-]{2,80})\s+(?:to\s+Pay|Refunding|Refunds|Fined|Penalized)/,
+  ];
+  for (const p of patterns) {
+    const m = p.exec(title);
+    if (m?.[1]) return m[1].replace(/\s+/g, " ").trim().slice(0, 240);
+  }
   if (description) {
-    const m2 = /against\s+([A-Z][A-Za-z0-9 &'\.,-]{2,80})/.exec(description);
+    const m2 = /against\s+([A-Z][A-Za-z0-9 &'.,-]{2,80})/.exec(description);
     if (m2?.[1]) return m2[1].trim();
   }
   return title.split(/ - | — |: /)[0]?.slice(0, 200).trim() ?? title.slice(0, 200);
 }
 
+function inferDateFromUrl(href: string): string | undefined {
+  const m = /\/press-releases\/(\d{4})\/(\d{2})\//.exec(href);
+  if (m?.[1] && m?.[2]) return `${m[1]}-${m[2]}-01`;
+  return undefined;
+}
+
 function sanitizeId(s: string): string {
-  return s.replace(/[^A-Za-z0-9._-]+/g, "-").slice(0, 120);
+  return s.replace(/[^A-Za-z0-9._-]+/g, "-").slice(0, 160);
 }

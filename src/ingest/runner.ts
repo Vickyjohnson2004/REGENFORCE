@@ -113,6 +113,8 @@ export async function runAdapter(adapter: AgencyAdapter): Promise<IngestReport> 
 
 export async function runAllAdapters(): Promise<IngestReport[]> {
   const reports: IngestReport[] = [];
+  const startedAt = Date.now();
+  logger.info("Starting full ingestion across all adapters");
   for (const adapter of allAdapters()) {
     if (!isEnabled(adapter.agency)) {
       logger.info({ agency: adapter.agency }, "Skipping (disabled via INGEST_DISABLE)");
@@ -121,6 +123,26 @@ export async function runAllAdapters(): Promise<IngestReport[]> {
     const report = await runAdapter(adapter);
     reports.push(report);
   }
+  const totalInserted = reports.reduce((a, r) => a + r.actionsIngested, 0);
+  const totalUpdated = reports.reduce((a, r) => a + r.actionsUpdated, 0);
+  const totalErrors = reports.reduce((a, r) => a + r.errors.length, 0);
+  logger.info(
+    {
+      durationMs: Date.now() - startedAt,
+      totalInserted,
+      totalUpdated,
+      totalErrors,
+      perAgency: reports.map((r) => ({
+        agency: r.agency,
+        status: r.status,
+        inserted: r.actionsIngested,
+        updated: r.actionsUpdated,
+        errors: r.errors.length,
+        firstError: r.errors[0]?.message,
+      })),
+    },
+    "Full ingestion complete",
+  );
   return reports;
 }
 
