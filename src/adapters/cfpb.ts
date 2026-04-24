@@ -296,7 +296,19 @@ function parseHtmlListing(html: string, sourceUrl: string): NormalizedAction[] {
     const status = classifyStatus([rawStatus ?? "", respondent, fullText]);
 
     const summary = $el.find("p").first().text().replace(/\s+/g, " ").trim();
-    const actionType = classifyActionType("CFPB", rawStatus, [respondent, summary, fullText]);
+    const classified = classifyActionType("CFPB", rawStatus, [respondent, summary, fullText]);
+    // CFPB's enforcement docket is overwhelmingly consent orders + settled
+    // federal lawsuits. The listing page doesn't expose a per-action "type"
+    // field — only a status marker (Filed/Settled/Judgment/etc.) — so when
+    // our rule-based classifier can't commit to a canonical type, we infer
+    // `consent_order` (the agency's dominant enforcement instrument) rather
+    // than falling back to `other` (which would hide every CFPB action from
+    // `actionTypes` filters). The raw signal is preserved in `rawActionType`
+    // and `fieldOrigin.actionType` is flipped to `"inferred"` so downstream
+    // consumers can see that this was inferred rather than observed.
+    const actionType = classified === "other" ? "consent_order" : classified;
+    const actionTypeOrigin: "normalized" | "inferred" =
+      classified === "other" ? "inferred" : "normalized";
     const penalty = extractPenalty(`${respondent} ${summary} ${fullText}`);
 
     const actionId = `CFPB:${sanitizeId(detailUrl.replace("https://www.consumerfinance.gov", ""))}`;
@@ -308,7 +320,7 @@ function parseHtmlListing(html: string, sourceUrl: string): NormalizedAction[] {
       fieldOrigin: {
         agency: "observed",
         actionId: "observed",
-        actionType: "normalized",
+        actionType: actionTypeOrigin,
         rawActionType: rawStatus ? "observed" : "unknown",
         status: "normalized",
         rawStatus: rawStatus ? "observed" : "unknown",

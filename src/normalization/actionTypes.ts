@@ -43,6 +43,16 @@ const AGENCY_RULES: Record<Agency, Rule[]> = {
   ],
   CFPB: [
     { pattern: /\bstipulation\b/i, canonical: "consent_order" },
+    { pattern: /\bproposed\s+(order|final\s+order)\b/i, canonical: "consent_order" },
+    { pattern: /\b(default\s+)?judgment\b/i, canonical: "consent_order" },
+    { pattern: /\bpost[-\s]?judgment\b/i, canonical: "consent_order" },
+    { pattern: /\bsettled\b/i, canonical: "consent_order" },
+    { pattern: /\bfinal\s+order\b/i, canonical: "consent_order" },
+    // CFPB sues in federal court before settlement — pending/litigation
+    // status markers indicate contested litigation rather than a consent order.
+    { pattern: /\bpending\s+litigation\b/i, canonical: "litigation" },
+    { pattern: /\blitigation\b/i, canonical: "litigation" },
+    { pattern: /\bcomplaint\s+filed\b/i, canonical: "litigation" },
   ],
   FTC: [
     { pattern: /\badministrative\s+complaint\b/i, canonical: "administrative_proceeding" },

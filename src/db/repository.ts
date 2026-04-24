@@ -16,7 +16,21 @@ export interface SearchFilters {
   maxPenalty?: number;
   fromDate?: string;
   toDate?: string;
+  /**
+   * Strict full-text match. Used by `list_enforcement_actions.fullText` where
+   * the caller wants the exact phrase to land via tsquery AND semantics.
+   */
   fullText?: string;
+  /**
+   * Fuzzy topic match. Used by `search_enforcement_by_topic`. Splits the
+   * topic into tokens and matches any token via either tsquery or ILIKE
+   * substring on title/summary/allegations/respondent. This is the
+   * "did any of these words show up anywhere" behavior — critical for
+   * topics like "AML KYC" where the underlying text reads "BSA/AML" or
+   * "customer identification program" and strict AND-tokenization would
+   * miss the match entirely.
+   */
+  topicText?: string;
   limit?: number;
   offset?: number;
   /** Approx minimum fuzzy match score for entity resolution (0.0 – 1.0). */
@@ -226,6 +240,53 @@ export async function searchActions(filters: SearchFilters): Promise<SearchResul
     where.push(
       `search_vector @@ plainto_tsquery('english', $${values.length})`,
     );
+  }
+
+  if (filters.topicText) {
+    // Tokenize the topic so "AML KYC" matches any row mentioning AML OR KYC.
+    // We OR together three strategies:
+    //   1. websearch_to_tsquery on the whole phrase (well-formed English)
+    //   2. Per-token tsquery OR'd with `|` (catches mixed single-word hits)
+    //   3. Per-token ILIKE substring on title/summary/allegations/respondent
+    //      (critical for slash-delimited terms like "BSA/AML" where tsvector
+    //      tokenization produces "bsa/aml" as a single token that won't match
+    //      individual word queries — ILIKE catches those via substring).
+    const rawTopic = filters.topicText.trim();
+    const tokens = rawTopic
+      .split(/[\s,/|;]+/)
+      .map((t) => t.trim().replace(/[^\w&-]/g, ""))
+      .filter((t) => t.length >= 2)
+      .slice(0, 10);
+    const ilikePatterns =
+      tokens.length > 0 ? tokens.map((t) => `%${t}%`) : [`%${rawTopic}%`];
+    const tsqueryTokens = tokens
+      .map((t) => t.toLowerCase().replace(/[^a-z0-9]/g, ""))
+      .filter((t) => t.length >= 2);
+
+    const orClauses: string[] = [];
+
+    values.push(rawTopic);
+    orClauses.push(
+      `search_vector @@ websearch_to_tsquery('english', $${values.length})`,
+    );
+
+    if (tsqueryTokens.length > 0) {
+      values.push(tsqueryTokens.join(" | "));
+      orClauses.push(
+        `search_vector @@ to_tsquery('simple', $${values.length})`,
+      );
+    }
+
+    values.push(ilikePatterns);
+    const ilikeIdx = values.length;
+    orClauses.push(
+      `title       ILIKE ANY ($${ilikeIdx}::text[])`,
+      `summary     ILIKE ANY ($${ilikeIdx}::text[])`,
+      `allegations ILIKE ANY ($${ilikeIdx}::text[])`,
+      `respondent  ILIKE ANY ($${ilikeIdx}::text[])`,
+    );
+
+    where.push(`(${orClauses.join(" OR ")})`);
   }
 
   const whereClause = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";

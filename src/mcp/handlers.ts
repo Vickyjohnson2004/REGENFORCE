@@ -421,7 +421,7 @@ export async function handleSearchByTopic(
   const limit = clampInt(asNumber(args.limit), 1, 200, 25);
 
   const result = await searchActions({
-    fullText: topic,
+    topicText: topic,
     agencies,
     actionTypes,
     fromDate,
