@@ -34,7 +34,15 @@ async function main(): Promise<void> {
   await shutdownDatabase();
 }
 
-main().catch((err) => {
-  logger.error({ err }, "Migration failed");
-  process.exit(1);
-});
+main()
+  .then(() => {
+    // Force a clean exit. Without this, pino's async transport and any
+    // lingering pg-pool/keep-alive handles can keep the Node event loop
+    // alive, which blocks shell chains like `npm run db:migrate && npm start`
+    // from ever reaching the `&&`.
+    process.exit(0);
+  })
+  .catch((err) => {
+    logger.error({ err }, "Migration failed");
+    process.exit(1);
+  });

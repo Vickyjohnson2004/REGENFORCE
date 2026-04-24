@@ -239,7 +239,10 @@ async function start(): Promise<void> {
   //    healthcheck window. Ingestion runs in the background afterwards
   //    because a full 6-agency scrape can take several minutes and would
   //    otherwise block app.listen() past the healthcheck timeout.
-  app.listen(config.port, () => {
+  //
+  //    Bind to 0.0.0.0 explicitly (instead of Node's IPv6-preferred default)
+  //    so Railway's healthcheck host can reach the container.
+  const httpServer = app.listen(config.port, "0.0.0.0", () => {
     logger.info(
       {
         port: config.port,
@@ -249,6 +252,10 @@ async function start(): Promise<void> {
       },
       `REGENFORCE MCP server listening on port ${config.port}`,
     );
+  });
+  httpServer.on("error", (err) => {
+    logger.error({ err }, "HTTP server error; exiting");
+    process.exit(1);
   });
 
   // 2. Ping the DB out-of-band. A failure here only logs; /health reflects
