@@ -17,7 +17,9 @@ function num(name: string, fallback: number): number {
 }
 
 export const config = {
-  port: num("PORT", 4010),
+  // Railway typically routes to 3000 by default. Keep this as the fallback
+  // when PORT is not injected so public networking still works.
+  port: num("PORT", 3000),
   contextAuthEnabled: bool("CONTEXT_AUTH_ENABLED", false),
 
   databaseUrl: str("DATABASE_URL", "postgres://postgres:postgres@localhost:5432/regenforce"),

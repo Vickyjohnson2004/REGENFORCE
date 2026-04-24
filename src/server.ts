@@ -235,6 +235,9 @@ app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
 // ---------------------------------------------------------------------------
 
 async function start(): Promise<void> {
+  // Keep a plain console line for platform logs even if logger transport misbehaves.
+  console.log(`[startup] REGENFORCE booting on port ${config.port}`);
+
   // 1. Bind the HTTP listener FIRST so /health answers inside Railway's
   //    healthcheck window. Ingestion runs in the background afterwards
   //    because a full 6-agency scrape can take several minutes and would
@@ -243,6 +246,7 @@ async function start(): Promise<void> {
   //    Bind to 0.0.0.0 explicitly (instead of Node's IPv6-preferred default)
   //    so Railway's healthcheck host can reach the container.
   const httpServer = app.listen(config.port, "0.0.0.0", () => {
+    console.log(`[startup] HTTP listener bound on 0.0.0.0:${config.port}`);
     logger.info(
       {
         port: config.port,
