@@ -123,6 +123,15 @@ async function buildMetadata(): Promise<ResponseMetadata> {
   return meta;
 }
 
+function fallbackMetadata(reason = "metadata unavailable"): ResponseMetadata {
+  return {
+    generatedAt: new Date().toISOString(),
+    sourceUpdatedAt: null,
+    dataFreshness: reason,
+    agencyCoverage: {},
+  };
+}
+
 function describeFreshness(iso: string): string {
   const ageMs = Date.now() - new Date(iso).getTime();
   if (!Number.isFinite(ageMs) || ageMs < 0) return "unknown";
@@ -486,28 +495,40 @@ export async function handleListActions(
   const limit = clampInt(asNumber(args.limit), 1, 200, 50);
   const offset = clampInt(asNumber(args.offset), 0, 100_000, 0);
 
-  const result = await searchActions({
-    agencies,
-    actionTypes,
-    statuses,
-    fromDate,
-    toDate,
-    minPenalty,
-    maxPenalty,
-    fullText,
-    limit,
-    offset,
-  });
+  try {
+    const result = await searchActions({
+      agencies,
+      actionTypes,
+      statuses,
+      fromDate,
+      toDate,
+      minPenalty,
+      maxPenalty,
+      fullText,
+      limit,
+      offset,
+    });
 
-  const metadata = await buildMetadata();
-  return {
-    ok: true,
-    data: {
-      total: result.total,
-      actions: result.actions.map(decorateAction),
-      metadata,
-    },
-  };
+    const metadata = await buildMetadata();
+    return {
+      ok: true,
+      data: {
+        total: result.total,
+        actions: result.actions.map(decorateAction),
+        metadata,
+      },
+    };
+  } catch (e) {
+    logger.error({ err: e }, "list_enforcement_actions failed; returning empty schema-safe payload");
+    return {
+      ok: true,
+      data: {
+        total: 0,
+        actions: [],
+        metadata: fallbackMetadata("query failed"),
+      },
+    };
+  }
 }
 
 export async function handleGetAction(
