@@ -1,4 +1,5 @@
 import { XMLParser } from "fast-xml-parser";
+import * as cheerio from "cheerio";
 import type {
   NormalizedAction,
   Provenance,
@@ -14,6 +15,20 @@ import {
   type AdapterRunResult,
   type AgencyAdapter,
 } from "./base.js";
+
+/**
+ * How many pages of the SEC's paginated historical HTML listings to scrape on
+ * a full run. Each page holds 100 rows, so 15 pages ≈ 1500 litigation
+ * releases, giving ~3+ years of coverage. The proposal promises a 5-year
+ * lookback for enforcement history; tune SEC_HISTORY_PAGES or set env var
+ * SEC_HISTORY_PAGES to adjust.
+ */
+const SEC_HISTORY_PAGES = (() => {
+  const raw = Number(process.env.SEC_HISTORY_PAGES);
+  if (Number.isFinite(raw) && raw > 0 && raw <= 100) return Math.trunc(raw);
+  return 15;
+})();
+const SEC_ADMIN_HISTORY_PAGES = Math.min(10, SEC_HISTORY_PAGES);
 
 /**
  * SEC adapter: pulls from two RSS/Atom feeds and merges them:
@@ -35,7 +50,9 @@ import {
  */
 export class SECAdapter implements AgencyAdapter {
   readonly agency = "SEC" as const;
-  readonly runTimeoutMs = 30_000;
+  // Paginated HTML backfill of 25 pages × 100 rows can take 2-3 minutes on
+  // slow runs; give it headroom. Freshness-only incremental runs are fast.
+  readonly runTimeoutMs = 180_000;
 
   async fetchRecent(): Promise<AdapterRunResult> {
     const parser = new XMLParser({
@@ -51,7 +68,31 @@ export class SECAdapter implements AgencyAdapter {
     const seen = new Set<string>();
 
     // ------------------------------------------------------------------
-    // Feed 1: Litigation Releases (enforcement-only).
+    // Feed 0 (HTML historical): Paginated litigation-releases and
+    // administrative-proceedings listings. Each page holds up to 100 rows with
+    // a stable 2-column layout (Date | Respondents + Release No.). This is
+    // the only practical way to get multi-year historical depth; SEC's RSS
+    // feeds only return the most recent ~100 items.
+    // ------------------------------------------------------------------
+    await this.scrapePaginatedList({
+      baseUrl: "https://www.sec.gov/enforcement-litigation/litigation-releases",
+      sourceKey: "litigation_release",
+      pages: SEC_HISTORY_PAGES,
+      actions,
+      seen,
+      errors,
+    });
+    await this.scrapePaginatedList({
+      baseUrl: "https://www.sec.gov/enforcement-litigation/administrative-proceedings",
+      sourceKey: "administrative_proceeding",
+      pages: SEC_ADMIN_HISTORY_PAGES,
+      actions,
+      seen,
+      errors,
+    });
+
+    // ------------------------------------------------------------------
+    // Feed 1: Litigation Releases RSS (enforcement-only, freshness source).
     // SEC relocated these to /enforcement-litigation/* in 2025.
     // ------------------------------------------------------------------
     const litFeeds = [
@@ -176,6 +217,66 @@ export class SECAdapter implements AgencyAdapter {
     }
 
     return { agency: "SEC", sourceUrl: pressUrl, actions, errors };
+  }
+
+  private async scrapePaginatedList(params: {
+    baseUrl: string;
+    sourceKey: "litigation_release" | "administrative_proceeding";
+    pages: number;
+    actions: NormalizedAction[];
+    seen: Set<string>;
+    errors: AdapterRunResult["errors"];
+  }): Promise<void> {
+    for (let page = 0; page < params.pages; page += 1) {
+      const url = `${params.baseUrl}?page=${page}`;
+      let html: string;
+      try {
+        html = await fetchText(url, 20_000);
+      } catch (err) {
+        params.errors.push({
+          message: `SEC HTML page ${page} failed for ${params.baseUrl}: ${err instanceof Error ? err.message : String(err)}`,
+        });
+        // Stop paginating on failure rather than cascading.
+        break;
+      }
+      const $ = cheerio.load(html);
+      let rowsOnPage = 0;
+      $("tr.pr-list-page-row").each((_, tr) => {
+        const time = $(tr).find("time").first();
+        const iso = time.attr("datetime") ?? time.text().trim();
+        const anchor = $(tr).find(".release-view__respondents a").first();
+        const respondent = anchor.text().trim();
+        const href = anchor.attr("href") ?? "";
+        const releaseNoRaw = $(tr)
+          .find(".view-table_subfield_release_number .view-table_subfield_value")
+          .first()
+          .text()
+          .trim();
+        if (!respondent || !href) return;
+        const fullLink = href.startsWith("http")
+          ? href
+          : `https://www.sec.gov${href}`;
+        const title = respondent;
+        const action = this.buildAction({
+          sourceKey: params.sourceKey,
+          sourceUrl: params.baseUrl,
+          rawGuid: releaseNoRaw || fullLink,
+          title,
+          summary: undefined,
+          link: fullLink,
+          respondent,
+          pubDate: iso,
+        });
+        if (action && !params.seen.has(action.actionId)) {
+          params.seen.add(action.actionId);
+          params.actions.push(action);
+          rowsOnPage += 1;
+        }
+      });
+      // If a page yielded no parseable rows, we've likely paginated past the
+      // end; stop early.
+      if (rowsOnPage === 0) break;
+    }
   }
 
   private buildAction(params: {
@@ -307,12 +408,37 @@ function isExcluded(title: string, description: string): boolean {
 }
 
 function extractReleaseId(title: string, link: string, guid: string): string | null {
-  const linkMatch = /litreleases\/lr-?(\d+)/i.exec(link) || /litrel(\d+)/i.exec(link);
-  if (linkMatch?.[1]) return `LR-${linkMatch[1]}`;
-  const adminMatch = /\/litigation\/admin\/.*?(\d{4}-\d+)/i.exec(link);
-  if (adminMatch?.[1]) return `ADM-${adminMatch[1]}`;
+  // Litigation releases: LR-XXXXX from link or raw guid.
+  const lrFromLink =
+    /litigation-releases\/lr-(\d+)/i.exec(link) ||
+    /litreleases\/lr-?(\d+)/i.exec(link) ||
+    /litrel(\d+)/i.exec(link);
+  if (lrFromLink?.[1]) return `LR-${lrFromLink[1]}`;
+  const lrFromGuid = /LR-?(\d{3,})/i.exec(guid);
+  if (lrFromGuid?.[1]) return `LR-${lrFromGuid[1]}`;
+
+  // Administrative proceedings: modern path is
+  //   /files/litigation/admin/YYYY/34-XXXXXX.pdf    (Exchange Act)
+  //   /files/litigation/admin/YYYY/33-XXXXXX.pdf    (Securities Act)
+  //   /files/litigation/admin/YYYY/ia-XXXX.pdf      (Advisers Act)
+  // We key off the docket prefix present in the PDF name.
+  const adminPdf = /\/litigation\/admin\/\d{4}\/([\w-]+)\.pdf/i.exec(link);
+  if (adminPdf?.[1]) return `ADM-${adminPdf[1].toUpperCase()}`;
+  const adminOld = /\/litigation\/admin\/.*?(\d{4}-\d+)/i.exec(link);
+  if (adminOld?.[1]) return `ADM-${adminOld[1]}`;
+
+  // Admin release number text like "34-105275, AAER-4591" — prefer 34-/33-.
+  const adminFromGuid =
+    /(34-\d{5,})/i.exec(guid) ||
+    /(33-\d{5,})/i.exec(guid) ||
+    /(IA-\d{3,})/i.exec(guid) ||
+    /(AAER-\d{3,})/i.exec(guid);
+  if (adminFromGuid?.[1]) return `ADM-${adminFromGuid[1].toUpperCase()}`;
+
+  // Press releases.
   const pressMatch = /press[-_]?release\/(\d+-\d+)/i.exec(link) || /(\d{4}-\d+)\.htm/.exec(link);
   if (pressMatch?.[1]) return `PR-${pressMatch[1]}`;
+
   if (guid && guid.length < 200) return `GUID-${hashString(guid)}`;
   if (title) return `TITLE-${hashString(title)}`;
   return null;

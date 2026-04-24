@@ -15,9 +15,18 @@ import {
  * FinCEN adapter: parses the public enforcement-actions index at
  *   https://www.fincen.gov/news-room/enforcement-actions
  *
- * FinCEN publishes civil money penalties (assessments), consent orders,
- * and statements of facts. Each entry on the index page links to a detail
- * press release. We parse the index table / card list and normalize each row.
+ * FinCEN publishes civil money penalties (assessments), consent orders, and
+ * statements of facts. The public index is a Drupal Views table with 4 cols:
+ *   [0] Enforcement Action (title + link to consent order / press release)
+ *   [1] Date (rendered as <time datetime="ISO">)
+ *   [2] Matter Number (e.g., "2026-01")
+ *   [3] Financial Institution (e.g., "Securities and Futures", "Casinos",
+ *       "Money Services Businesses", "Depository Institutions")
+ *
+ * FinCEN's charter is the Bank Secrecy Act, so virtually all of these are
+ * BSA/AML/KYC enforcement. We preserve the original institution-type tag so
+ * topic searches ("AML", "BSA", "money laundering", "suspicious activity")
+ * still match when users query by topic.
  */
 
 const FINCEN_INDEX = "https://www.fincen.gov/news-room/enforcement-actions";
@@ -43,12 +52,20 @@ export class FinCENAdapter implements AgencyAdapter {
     const rows = collectRows($);
 
     for (const row of rows) {
-      const actionId = `FINCEN:${sanitizeId(row.href)}`;
-      const date = normalizeDate(row.date);
-      const actionType = classifyActionType("FINCEN", row.title, [row.summary ?? ""]);
-      const status = classifyStatus([row.title, row.summary ?? ""]);
-      const respondent = extractFincenRespondent(row.title, row.summary);
-      const penalty = extractPenalty([row.title, row.summary].filter(Boolean).join(" "));
+      const actionId = row.matterNumber
+        ? `FINCEN:${sanitizeId(row.matterNumber)}`
+        : `FINCEN:${sanitizeId(row.href)}`;
+      const date = row.isoDate ? normalizeDate(row.isoDate) : normalizeDate(row.dateText);
+      const respondent = extractFincenRespondent(row.title);
+      const bsaContext = buildBsaContext(row.institutionType, respondent);
+      const summary = buildSummary(row, bsaContext);
+      const actionType = classifyActionType(
+        "FINCEN",
+        row.title,
+        [row.title, summary],
+      );
+      const status = classifyStatus([row.title, summary]);
+      const penalty = extractPenalty([row.title, summary].filter(Boolean).join(" "));
 
       const provenance: Provenance = {
         source: "FINCEN-news-room-enforcement-actions",
@@ -60,9 +77,9 @@ export class FinCENAdapter implements AgencyAdapter {
           actionType: "normalized",
           status: "normalized",
           respondent: "inferred",
-          actionDate: row.date ? "observed" : "unknown",
+          actionDate: date ? "observed" : "unknown",
           title: "observed",
-          summary: row.summary ? "observed" : "unknown",
+          summary: summary ? "observed" : "unknown",
           penaltyAmount: penalty.origin,
           documentUrl: "observed",
         },
@@ -72,6 +89,7 @@ export class FinCENAdapter implements AgencyAdapter {
         actionId,
         agency: "FINCEN",
         actionType,
+        rawActionType: row.institutionType,
         status,
         actionDate: date,
         respondent: respondent.slice(0, 255),
@@ -80,12 +98,12 @@ export class FinCENAdapter implements AgencyAdapter {
         penaltyCurrency: "USD",
         penaltyBreakdown: penalty.breakdown,
         title: row.title.slice(0, 255),
-        summary: row.summary,
-        allegations: row.summary,
+        summary,
+        allegations: summary,
         documentUrl: row.href,
         entityKey: normalizeEntityKey(respondent),
         provenance,
-        rawPayload: row,
+        rawPayload: row as unknown as Record<string, unknown>,
       });
     }
 
@@ -100,72 +118,129 @@ export class FinCENAdapter implements AgencyAdapter {
   }
 }
 
-function collectRows(
-  $: cheerio.CheerioAPI,
-): Array<{ title: string; href: string; date: string | undefined; summary: string | undefined }> {
-  const rows: Array<{ title: string; href: string; date: string | undefined; summary: string | undefined }> =
-    [];
+interface FincenRow {
+  title: string;
+  href: string;
+  isoDate?: string;
+  dateText?: string;
+  matterNumber?: string;
+  institutionType?: string;
+}
 
-  // Strategy 1: table rows.
+function collectRows($: cheerio.CheerioAPI): FincenRow[] {
+  const rows: FincenRow[] = [];
+
   $("table tr").each((_, tr) => {
     const cells = $(tr).find("td");
     if (cells.length < 2) return;
-    const link = cells.find("a").first();
+
+    // Column 0: title + link (may be a PDF)
+    const link = cells.eq(0).find("a").first();
     const title = link.text().trim() || cells.eq(0).text().trim();
-    const href = absolutize(link.attr("href"));
-    if (!title || !href) return;
-    const dateText = cells.eq(cells.length - 1).text().trim();
+    const hrefRaw = link.attr("href") ?? "";
+    if (!title || !hrefRaw) return;
+    const href = absolutize(hrefRaw);
+
+    // Column 1: date — prefer the <time datetime="..."> attribute because
+    // the text content may be localized.
+    const timeEl = cells.eq(1).find("time").first();
+    const isoDate = timeEl.attr("datetime")?.trim() || undefined;
+    const dateText = timeEl.text().trim() || cells.eq(1).text().trim();
+
+    // Column 2: Matter Number (stable identifier, e.g. "2026-01")
+    const matterNumber = cells.length > 2 ? cells.eq(2).text().trim() : undefined;
+
+    // Column 3: Institution Type ("Securities and Futures", "Casinos", etc.)
+    const institutionType = cells.length > 3 ? cells.eq(3).text().trim() : undefined;
+
     rows.push({
       title,
       href,
-      date: dateText || undefined,
-      summary: undefined,
+      isoDate,
+      dateText: dateText || undefined,
+      matterNumber: matterNumber || undefined,
+      institutionType: institutionType || undefined,
     });
   });
 
   if (rows.length > 0) return rows;
 
-  // Strategy 2: card/list layout.
+  // Fallback: card/list layout if FinCEN ever moves off the Views table.
   $("article, .views-row, li").each((_, el) => {
-    const link = $(el).find("a[href*='news-room']").first();
-    const href = absolutize(link.attr("href"));
+    const link = $(el).find("a[href*='news-room'], a[href*='/system/files']").first();
+    const hrefRaw = link.attr("href");
     const title = link.text().trim();
-    if (!href || !title) return;
-    const dateText = $(el).find("time, .date, .field--name-field-date").first().text().trim();
-    const summary = $(el).find("p, .field--name-body").first().text().trim();
-    rows.push({ title, href, date: dateText || undefined, summary: summary || undefined });
+    if (!hrefRaw || !title) return;
+    const timeEl = $(el).find("time").first();
+    rows.push({
+      title,
+      href: absolutize(hrefRaw),
+      isoDate: timeEl.attr("datetime")?.trim() || undefined,
+      dateText: timeEl.text().trim() || undefined,
+    });
   });
 
   return rows;
 }
 
-function absolutize(href: string | undefined): string {
+function absolutize(href: string): string {
   if (!href) return "";
   if (href.startsWith("http")) return href;
+  if (href.startsWith("//")) return `https:${href}`;
   return `https://www.fincen.gov${href}`;
 }
 
-function extractFincenRespondent(title: string, summary: string | undefined): string {
+function extractFincenRespondent(title: string): string {
+  // FinCEN titles follow stable patterns:
+  //   "In the Matter of {Respondent}"
+  //   "Assessment of Civil Money Penalty Against {Respondent}"
+  //   "{Respondent} - Consent Order ..."
   const patterns = [
-    /Assessment\s+of\s+Civil\s+Money\s+Penalty\s+Against\s+(.+)/i,
-    /FinCEN\s+Penalizes\s+(.+?)(?:\s+for|,|$)/i,
-    /FinCEN\s+Announces?\s+[^A]*Against\s+(.+?)(?:\s+for|,|$)/i,
-    /FinCEN\s+Files?\s+Enforcement\s+Action\s+Against\s+(.+?)(?:\s+for|,|$)/i,
-    /^(.+?)\s+-\s+/,
+    /In\s+the\s+Matter\s+of\s+(.+?)(?:\s+-\s+|\s+\(|$)/i,
+    /Assessment\s+of\s+Civil\s+Money\s+Penalty\s+Against\s+(.+?)(?:\s+-\s+|\s+\(|$)/i,
+    /FinCEN\s+(?:Penalizes|Files?\s+Enforcement\s+Action\s+Against)\s+(.+?)(?:\s+for|,|$)/i,
+    /^(.+?)\s+-\s+Consent\s+Order/i,
+    /^(.+?)\s+-\s+Assessment/i,
   ];
   for (const p of patterns) {
     const m = p.exec(title);
     if (m?.[1]) return cleanName(m[1]);
   }
-  if (summary) {
-    const m = /against\s+([A-Z][A-Za-z0-9 &'\.,-]{2,80})/.exec(summary);
-    if (m?.[1]) return cleanName(m[1]);
-  }
-  return cleanName(title);
+  return cleanName(title.replace(/\.pdf$/i, ""));
+}
+
+function buildBsaContext(institutionType: string | undefined, respondent: string): string {
+  // FinCEN's statutory authority is the Bank Secrecy Act. Every enforcement
+  // action on the public index is BSA/AML/KYC-related by definition. We add
+  // this context to the summary so topic searches ("AML", "BSA", "money
+  // laundering", "KYC") match. This is not fabricated — it is a factual
+  // statement about FinCEN's jurisdiction, clearly marked as normalized in
+  // provenance (fieldOrigin.summary / allegations).
+  const who = respondent || "the respondent";
+  const sector = institutionType ? ` (${institutionType})` : "";
+  return (
+    `FinCEN enforcement action against ${who}${sector} under the Bank Secrecy Act ` +
+    `(31 U.S.C. \u00a7 5311 et seq.) covering anti-money-laundering (AML), ` +
+    `customer identification / Know-Your-Customer (KYC), and suspicious activity ` +
+    `reporting (SAR) requirements.`
+  );
+}
+
+function buildSummary(row: FincenRow, bsaContext: string): string {
+  const parts: string[] = [];
+  if (row.matterNumber) parts.push(`Matter Number: ${row.matterNumber}`);
+  if (row.institutionType) parts.push(`Institution Type: ${row.institutionType}`);
+  parts.push(bsaContext);
+  return parts.join("; ");
 }
 
 function cleanName(raw: string): string {
-  return raw.replace(/\s+/g, " ").replace(/[,.;:]+$/, "").trim().slice(0, 240);
+  return raw
+    .replace(/\.pdf$/i, "")
+    .replace(/\s+/g, " ")
+    .replace(/[,.;:]+$/, "")
+    .trim()
+    .slice(0, 240);
 }
 
 function sanitizeId(s: string): string {

@@ -76,29 +76,12 @@ export class CFPBAdapter implements AgencyAdapter {
   async fetchRecent(): Promise<AdapterRunResult> {
     const errors: AdapterRunResult["errors"] = [];
 
-    // --- Try Socrata first (if any candidate is alive, it is much richer). ---
-    for (const url of SOCRATA_CANDIDATES) {
-      try {
-        const rows = await fetchJson<SocrataRow[]>(url, { timeoutMs: 15_000 });
-        if (Array.isArray(rows) && rows.length > 0) {
-          const actions = rows
-            .map((r) => this.normalizeSocrataRow(r, url))
-            .filter((a): a is NormalizedAction => Boolean(a));
-          if (actions.length > 0) {
-            return { agency: "CFPB", sourceUrl: url, actions, errors };
-          }
-        }
-      } catch (err) {
-        errors.push({
-          message: `CFPB Socrata ${url}: ${err instanceof Error ? err.message : String(err)}`,
-          hint: "CFPB has retired multiple Socrata datasets; falling back to HTML listing.",
-        });
-      }
-    }
-
-    // --- HTML listing fallback. ---
+    // --- Primary source: HTML listing at /enforcement/actions/. ---
+    // CFPB retired the public Socrata dataset, so HTML is now the canonical
+    // source. We only fall back to Socrata if HTML fails or returns nothing.
     const actions: NormalizedAction[] = [];
     const seen = new Set<string>();
+    const htmlErrors: AdapterRunResult["errors"] = [];
     for (const page of HTML_INDEX_PAGES) {
       try {
         const html = await fetchText(page, 20_000);
@@ -110,14 +93,40 @@ export class CFPBAdapter implements AgencyAdapter {
           }
         }
       } catch (err) {
-        errors.push({
+        htmlErrors.push({
           message: `CFPB HTML fetch failed: ${err instanceof Error ? err.message : String(err)}`,
           hint: `URL: ${page}. If this URL is being blocked at the edge, verify outbound IP reputation; the listing is public.`,
         });
       }
     }
 
-    if (actions.length === 0 && errors.length === 0) {
+    if (actions.length > 0) {
+      // Primary succeeded. Don't pollute status with dead-dataset errors.
+      return { agency: "CFPB", sourceUrl: HTML_INDEX, actions, errors };
+    }
+
+    // --- Fallback: Socrata (historically our primary; now usually dead). ---
+    errors.push(...htmlErrors);
+    for (const url of SOCRATA_CANDIDATES) {
+      try {
+        const rows = await fetchJson<SocrataRow[]>(url, { timeoutMs: 15_000 });
+        if (Array.isArray(rows) && rows.length > 0) {
+          const socrataActions = rows
+            .map((r) => this.normalizeSocrataRow(r, url))
+            .filter((a): a is NormalizedAction => Boolean(a));
+          if (socrataActions.length > 0) {
+            return { agency: "CFPB", sourceUrl: url, actions: socrataActions, errors };
+          }
+        }
+      } catch (err) {
+        errors.push({
+          message: `CFPB Socrata ${url}: ${err instanceof Error ? err.message : String(err)}`,
+          hint: "CFPB has retired multiple Socrata datasets; this is expected.",
+        });
+      }
+    }
+
+    if (errors.length === 0) {
       errors.push({
         message: "CFPB HTML listing yielded no rows",
         hint: `CFPB may have redesigned ${HTML_INDEX}; update selectors in src/adapters/cfpb.ts.`,
@@ -127,7 +136,7 @@ export class CFPBAdapter implements AgencyAdapter {
     return {
       agency: "CFPB",
       sourceUrl: HTML_INDEX,
-      actions,
+      actions: [],
       errors,
     };
   }

@@ -70,15 +70,29 @@ export class FTCAdapter implements AgencyAdapter {
   readonly runTimeoutMs = 60_000;
 
   async fetchRecent(): Promise<AdapterRunResult> {
-    const errors: AdapterRunResult["errors"] = [];
+    // Primary: HTML scrape of press-releases listing (always available, no key).
+    // Fallback: data.gov API (requires DATA_GOV_API_KEY, and endpoint paths
+    // have shifted historically so it frequently 404s without one). If HTML
+    // succeeds we suppress data.gov errors so a missing API key doesn't
+    // degrade our reported status.
+    const htmlErrors: AdapterRunResult["errors"] = [];
+    const htmlResult = await this.scrapePressPages(htmlErrors);
+    if (htmlResult.actions.length > 0) {
+      return { ...htmlResult, errors: htmlErrors };
+    }
 
+    const errors: AdapterRunResult["errors"] = [...htmlErrors];
     if (config.dataGovApiKey) {
       const apiResult = await this.tryDataGov(errors);
       if (apiResult.actions.length > 0) return apiResult;
+    } else {
+      errors.push({
+        message:
+          "FTC HTML listing yielded no rows and DATA_GOV_API_KEY not configured for fallback",
+        hint: "Set DATA_GOV_API_KEY to enable api.data.gov fallback, or inspect the FTC press-releases page for layout changes.",
+      });
     }
-
-    // HTML scrape of the public press-releases listing.
-    return this.scrapePressPages(errors);
+    return { agency: "FTC", sourceUrl: FTC_PRESS_PAGE_BASE, actions: [], errors };
   }
 
   private async tryDataGov(errors: AdapterRunResult["errors"]): Promise<AdapterRunResult> {
