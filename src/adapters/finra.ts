@@ -65,9 +65,15 @@ export class FINRAAdapter implements AgencyAdapter {
     for (let page = 0; page < FINRA_HISTORY_PAGES; page += 1) {
       const url = page === 0 ? FINRA_LANDING : `${FINRA_LANDING}?page=${page}`;
       // Courtesy delay between pages — FINRA's WAF returns 403 on rapid
-      // sequential requests from the same IP. 2s keeps us well below the
-      // observed threshold while still completing 25 pages in ~60 seconds.
-      if (page > 0) await new Promise((r) => setTimeout(r, 2000));
+      // sequential requests from the same IP. Observed: 2s was still too
+      // aggressive from Railway (403 at page 6). 4.5s comfortably stays
+      // under the threshold; 25 pages completes in ~115s. Configurable via
+      // FINRA_PAGE_DELAY_MS env var for tuning.
+      if (page > 0) {
+        const delay = Number(process.env.FINRA_PAGE_DELAY_MS);
+        const ms = Number.isFinite(delay) && delay > 0 ? delay : 4500;
+        await new Promise((r) => setTimeout(r, ms));
+      }
       let html: string;
       try {
         html = await fetchText(url, 20_000);
