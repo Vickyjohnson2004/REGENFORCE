@@ -74,7 +74,9 @@ interface SocrataRow {
 
 export class CFPBAdapter implements AgencyAdapter {
   readonly agency = "CFPB" as const;
-  readonly runTimeoutMs = 60_000;
+  // 20 paginated pages × ~2-3s each = ~50s worst-case; 3 minutes gives us
+  // safe headroom and matches the SEC / FTC / OCC adapters.
+  readonly runTimeoutMs = 180_000;
 
   async fetchRecent(): Promise<AdapterRunResult> {
     const errors: AdapterRunResult["errors"] = [];

@@ -70,7 +70,9 @@ interface DataGovResponse<T> {
 
 export class FTCAdapter implements AgencyAdapter {
   readonly agency = "FTC" as const;
-  readonly runTimeoutMs = 60_000;
+  // 20 paginated pages × ~4s each = ~80s worst-case; give it 3 minutes of
+  // headroom the same way SEC / CFPB / OCC have to absorb slow responses.
+  readonly runTimeoutMs = 180_000;
 
   async fetchRecent(): Promise<AdapterRunResult> {
     // Primary: HTML scrape of press-releases listing (always available, no key).
