@@ -14,4 +14,4 @@ RUN npm install --omit=dev --no-audit --no-fund
 COPY --from=build /app/dist ./dist
 COPY db ./db
 EXPOSE 4010
-CMD ["sh", "-c", "node dist/db/migrate.js && node dist/server.js"]
+CMD ["sh", "-c", "echo '[boot] running migration'; node dist/db/migrate.js; echo '[boot] starting server'; exec node dist/server.js"]
