@@ -235,16 +235,10 @@ app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
 // ---------------------------------------------------------------------------
 
 async function start(): Promise<void> {
-  const dbOk = await pingDatabase();
-  if (!dbOk) {
-    logger.error(
-      "Database is unreachable. Verify DATABASE_URL and that `npm run db:migrate` has been executed.",
-    );
-  }
-
-  await runOnStartupIfConfigured();
-  startIngestionScheduler();
-
+  // 1. Bind the HTTP listener FIRST so /health answers inside Railway's
+  //    healthcheck window. Ingestion runs in the background afterwards
+  //    because a full 6-agency scrape can take several minutes and would
+  //    otherwise block app.listen() past the healthcheck timeout.
   app.listen(config.port, () => {
     logger.info(
       {
@@ -255,6 +249,23 @@ async function start(): Promise<void> {
       },
       `REGENFORCE MCP server listening on port ${config.port}`,
     );
+  });
+
+  // 2. Ping the DB out-of-band. A failure here only logs; /health reflects
+  //    it via its own ping so Railway's healthcheck will fail the container
+  //    if DATABASE_URL is genuinely misconfigured.
+  const dbOk = await pingDatabase();
+  if (!dbOk) {
+    logger.error(
+      "Database is unreachable. Verify DATABASE_URL and that `npm run db:migrate` has been executed.",
+    );
+  }
+
+  // 3. Start the cron and kick off the optional first-boot ingestion as a
+  //    background task (fire-and-forget with error logging).
+  startIngestionScheduler();
+  void runOnStartupIfConfigured().catch((err) => {
+    logger.error({ err }, "Startup ingestion failed; scheduler will retry");
   });
 }
 
