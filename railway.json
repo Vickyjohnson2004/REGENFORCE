@@ -8,7 +8,7 @@
           "nixPkgs": ["nodejs_20"]
         },
         "install": {
-          "cmds": ["npm ci --omit=dev=false"]
+          "cmds": ["npm ci --include=dev"]
         },
         "build": {
           "cmds": ["npm run build"]
