@@ -38,53 +38,81 @@ const FINRA_LANDING =
 const FINRA_ROW_CASE_URL =
   "https://www.finra.org/rules-guidance/oversight-enforcement/finra-disciplinary-actions?search=";
 
+/**
+ * Number of paginated pages of the disciplinary-actions table to ingest.
+ * Each page holds 15 rows. FINRA's WAF rate-limits rapid sequential
+ * requests from the same IP (observed 403 after ~5 page loads without
+ * delay). With a 2-second delay between pages we can safely ingest
+ * ~25 pages ≈ 375 actions on each cron run before risk of the WAF
+ * flagging us. Override via FINRA_HISTORY_PAGES env var for deeper or
+ * shallower backfill.
+ */
+const FINRA_HISTORY_PAGES = (() => {
+  const raw = Number(process.env.FINRA_HISTORY_PAGES);
+  if (Number.isFinite(raw) && raw > 0 && raw <= 300) return Math.trunc(raw);
+  return 25;
+})();
+
 export class FINRAAdapter implements AgencyAdapter {
   readonly agency = "FINRA" as const;
-  readonly runTimeoutMs = 30_000;
+  readonly runTimeoutMs = 300_000;
 
   async fetchRecent(): Promise<AdapterRunResult> {
     const errors: AdapterRunResult["errors"] = [];
-    let html: string;
-    try {
-      html = await fetchText(FINRA_LANDING, 20_000);
-    } catch (err) {
-      errors.push({
-        message: `FINRA landing fetch failed: ${err instanceof Error ? err.message : String(err)}`,
-        hint: `Verify ${FINRA_LANDING} still serves the disciplinary-actions table.`,
-      });
-      return { agency: "FINRA", sourceUrl: FINRA_LANDING, actions: [], errors };
-    }
-
-    const $ = cheerio.load(html);
     const actions: NormalizedAction[] = [];
+    const seen = new Set<string>();
 
-    // Primary strategy: parse the consolidated <table>.
-    $("table tr").each((_, tr) => {
-      const cells = $(tr).find("td");
-      if (cells.length < 4) return;
+    for (let page = 0; page < FINRA_HISTORY_PAGES; page += 1) {
+      const url = page === 0 ? FINRA_LANDING : `${FINRA_LANDING}?page=${page}`;
+      // Courtesy delay between pages — FINRA's WAF returns 403 on rapid
+      // sequential requests from the same IP. 2s keeps us well below the
+      // observed threshold while still completing 25 pages in ~60 seconds.
+      if (page > 0) await new Promise((r) => setTimeout(r, 2000));
+      let html: string;
+      try {
+        html = await fetchText(url, 20_000);
+      } catch (err) {
+        errors.push({
+          message: `FINRA page ${page} fetch failed: ${err instanceof Error ? err.message : String(err)}`,
+        });
+        // Stop paginating if a page fails — avoids cascading errors.
+        break;
+      }
+      const $ = cheerio.load(html);
+      let rowsOnPage = 0;
+      $("table tr").each((_, tr) => {
+        const cells = $(tr).find("td");
+        if (cells.length < 4) return;
 
-      const caseNumber = cells.eq(0).text().trim();
-      const description = cells.eq(1).text().trim();
-      const rawActionType = cells.eq(2).text().trim();
-      const respondent = cells.eq(3).text().trim();
-      const dateText = cells.length >= 5 ? cells.eq(4).text().trim() : "";
+        const caseNumber = cells.eq(0).text().trim();
+        const description = cells.eq(1).text().trim();
+        const rawActionType = cells.eq(2).text().trim();
+        const respondent = cells.eq(3).text().trim();
+        const dateText = cells.length >= 5 ? cells.eq(4).text().trim() : "";
 
-      if (!caseNumber || !respondent) return;
-      if (caseNumber.toLowerCase() === "case number") return; // header row
+        if (!caseNumber || !respondent) return;
+        if (caseNumber.toLowerCase() === "case number") return; // header row
 
-      const action = buildAction({
-        caseNumber,
-        description,
-        rawActionType,
-        respondent,
-        dateText,
+        const action = buildAction({
+          caseNumber,
+          description,
+          rawActionType,
+          respondent,
+          dateText,
+        });
+        if (action && !seen.has(action.actionId)) {
+          seen.add(action.actionId);
+          actions.push(action);
+          rowsOnPage += 1;
+        }
       });
-      if (action) actions.push(action);
-    });
+      // A page with no new rows usually means we've paginated past the end.
+      if (rowsOnPage === 0) break;
+    }
 
     if (actions.length === 0) {
       errors.push({
-        message: "FINRA landing page yielded no table rows",
+        message: "FINRA paginated listing yielded no table rows",
         hint: `FINRA may have changed the disciplinary-actions layout. Inspect ${FINRA_LANDING} and update table selectors in src/adapters/finra.ts.`,
       });
     }

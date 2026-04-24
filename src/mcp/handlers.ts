@@ -564,13 +564,38 @@ export async function handleGetAgencyCoverage(): Promise<HandlerOutcome<Record<s
     AGENCIES.map(async (agency) => {
       const row = coverage.find((c) => c.agency === agency) ?? null;
       const lastRun = await getLastIngestionRun(agency);
+      const totalActions = row?.totalActions ?? 0;
+      const earliestAction = row?.earliestAction ?? null;
+      const latestAction = row?.latestAction ?? null;
+      // Derive an explicit coverageStatus so downstream agents / reviewers
+      // can tell at a glance which agencies are live, partial, or unavailable
+      // — we never silently pretend coverage exists where it doesn't.
+      let coverageStatus: "live" | "partial" | "stale" | "unavailable";
+      let coverageNote: string | null = null;
+      if (totalActions === 0) {
+        coverageStatus = "unavailable";
+        coverageNote =
+          lastRun?.errorMessage
+            ? `No actions ingested. Last ingestion error: ${lastRun.errorMessage}`
+            : "No actions ingested yet. Consult lastIngestedAt / lastIngestStatus for details.";
+      } else if (lastRun?.status === "error") {
+        coverageStatus = "stale";
+        coverageNote = `Latest ingestion failed (${lastRun.errorMessage ?? "unknown error"}); data served is from previous successful run.`;
+      } else if (lastRun?.status === "partial") {
+        coverageStatus = "partial";
+        coverageNote = "Latest ingestion completed partially; some sources did not respond.";
+      } else {
+        coverageStatus = "live";
+      }
       return {
         agency,
-        earliestAction: row?.earliestAction ?? null,
-        latestAction: row?.latestAction ?? null,
-        totalActions: row?.totalActions ?? 0,
+        earliestAction,
+        latestAction,
+        totalActions,
         lastIngestedAt: row?.lastIngestedAt ?? lastRun?.completedAt ?? null,
         lastIngestStatus: lastRun?.status ?? null,
+        coverageStatus,
+        coverageNote,
       };
     }),
   );

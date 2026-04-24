@@ -643,8 +643,15 @@ export const TOOLS = [
               totalActions: { type: "number" },
               lastIngestedAt: { type: ["string", "null"] },
               lastIngestStatus: { type: ["string", "null"] },
+              coverageStatus: {
+                type: "string",
+                enum: ["live", "partial", "stale", "unavailable"],
+                description:
+                  "Explicit coverage classification so consumers can tell at a glance which agencies are backed by fresh real data ('live'), which are missing or fabricated nothing ('unavailable'), and which are running on stale data.",
+              },
+              coverageNote: { type: ["string", "null"] },
             },
-            required: ["agency", "totalActions"],
+            required: ["agency", "totalActions", "coverageStatus"],
           },
         },
         metadata: METADATA_SCHEMA,

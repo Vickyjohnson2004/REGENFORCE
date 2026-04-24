@@ -33,11 +33,14 @@ import {
  */
 
 const HTML_INDEX = "https://www.consumerfinance.gov/enforcement/actions/";
-const HTML_INDEX_PAGES = [
-  "https://www.consumerfinance.gov/enforcement/actions/",
-  "https://www.consumerfinance.gov/enforcement/actions/?page=2",
-  "https://www.consumerfinance.gov/enforcement/actions/?page=3",
-];
+const CFPB_MAX_PAGES = (() => {
+  const raw = Number(process.env.CFPB_HISTORY_PAGES);
+  if (Number.isFinite(raw) && raw > 0 && raw <= 50) return Math.trunc(raw);
+  return 20;
+})();
+const HTML_INDEX_PAGES = Array.from({ length: CFPB_MAX_PAGES }, (_, i) =>
+  i === 0 ? HTML_INDEX : `${HTML_INDEX}?page=${i + 1}`,
+);
 
 // Candidate Socrata dataset IDs we've seen over time. We try them in order;
 // any that return a JSON array are used. If all fail we fall back to HTML.
@@ -86,17 +89,25 @@ export class CFPBAdapter implements AgencyAdapter {
       try {
         const html = await fetchText(page, 20_000);
         const parsed = parseHtmlListing(html, page);
+        let newThisPage = 0;
         for (const a of parsed) {
           if (!seen.has(a.actionId)) {
             seen.add(a.actionId);
             actions.push(a);
+            newThisPage += 1;
           }
         }
+        // Stop paginating once we hit a page with no new entries — we've
+        // reached the end of the archive. This avoids hammering the server
+        // for pages that don't exist.
+        if (newThisPage === 0 && actions.length > 0) break;
       } catch (err) {
         htmlErrors.push({
           message: `CFPB HTML fetch failed: ${err instanceof Error ? err.message : String(err)}`,
           hint: `URL: ${page}. If this URL is being blocked at the edge, verify outbound IP reputation; the listing is public.`,
         });
+        // Stop paginating on error to avoid cascading failures.
+        break;
       }
     }
 

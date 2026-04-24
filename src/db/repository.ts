@@ -164,14 +164,27 @@ export async function searchActions(filters: SearchFilters): Promise<SearchResul
   const values: unknown[] = [];
   const where: string[] = [];
 
+  // `word_similarity` measures how well the query appears as a contiguous
+  // substring ("word") inside the stored entity_key — it gives 0.9+ for
+  // "robinhood" vs "robinhood-financial-llc" where plain `similarity` scores
+  // only ~0.32 because of length difference. We keep plain similarity as a
+  // fallback for typo tolerance and combine both with an ILIKE substring
+  // match for extreme edge cases ("bank of america" vs "bank of america na").
   const select = entityKey
-    ? `SELECT *, similarity(entity_key, $1) AS entity_match_score, COUNT(*) OVER() AS total_count`
+    ? `SELECT *,
+              GREATEST(similarity(entity_key, $1), word_similarity($1, entity_key)) AS entity_match_score,
+              COUNT(*) OVER() AS total_count`
     : `SELECT *, NULL::real AS entity_match_score, COUNT(*) OVER() AS total_count`;
 
   if (entityKey) {
     values.push(entityKey); // $1
     where.push(
-      `(entity_key = $${values.length} OR similarity(entity_key, $${values.length}) >= ${minEntityScore.toFixed(2)})`,
+      `(
+         entity_key = $${values.length}
+         OR similarity(entity_key, $${values.length}) >= ${minEntityScore.toFixed(2)}
+         OR word_similarity($${values.length}, entity_key) >= ${Math.max(0.45, minEntityScore - 0.1).toFixed(2)}
+         OR entity_key ILIKE '%' || $${values.length} || '%'
+       )`,
     );
   }
 
@@ -238,10 +251,15 @@ export async function searchActions(filters: SearchFilters): Promise<SearchResul
     }>(
       `
       SELECT respondent, entity_key,
-             MAX(similarity(entity_key, $1))::text AS best_score,
+             GREATEST(
+               MAX(similarity(entity_key, $1)),
+               MAX(word_similarity($1, entity_key))
+             )::text AS best_score,
              COUNT(*)::text AS count
       FROM enforcement_actions
       WHERE similarity(entity_key, $1) >= ${minEntityScore.toFixed(2)}
+         OR word_similarity($1, entity_key) >= ${Math.max(0.45, minEntityScore - 0.1).toFixed(2)}
+         OR entity_key ILIKE '%' || $1 || '%'
          OR entity_key = $1
       GROUP BY respondent, entity_key
       ORDER BY best_score DESC, count DESC

@@ -35,11 +35,14 @@ import {
 
 const FTC_PRESS_PAGE_BASE =
   "https://www.ftc.gov/news-events/news/press-releases?items_per_page=50";
-const FTC_PRESS_PAGES = [
-  FTC_PRESS_PAGE_BASE,
-  `${FTC_PRESS_PAGE_BASE}&page=1`,
-  `${FTC_PRESS_PAGE_BASE}&page=2`,
-];
+const FTC_PRESS_MAX_PAGES = (() => {
+  const raw = Number(process.env.FTC_HISTORY_PAGES);
+  if (Number.isFinite(raw) && raw > 0 && raw <= 50) return Math.trunc(raw);
+  return 20;
+})();
+const FTC_PRESS_PAGES = Array.from({ length: FTC_PRESS_MAX_PAGES }, (_, i) =>
+  i === 0 ? FTC_PRESS_PAGE_BASE : `${FTC_PRESS_PAGE_BASE}&page=${i}`,
+);
 const DATA_GOV_BASE = "https://api.data.gov/ftc/v0";
 
 interface FtcCase {
@@ -142,17 +145,21 @@ export class FTCAdapter implements AgencyAdapter {
       try {
         const html = await fetchText(page, 20_000);
         const parsed = parseFtcListing(html, page);
+        let newThisPage = 0;
         for (const a of parsed) {
           if (!seen.has(a.actionId)) {
             seen.add(a.actionId);
             actions.push(a);
+            newThisPage += 1;
           }
         }
+        if (newThisPage === 0 && actions.length > 0) break;
       } catch (err) {
         errors.push({
           message: `FTC press-release page fetch failed: ${err instanceof Error ? err.message : String(err)}`,
           hint: `URL: ${page}. Verify in browser.`,
         });
+        break;
       }
     }
 

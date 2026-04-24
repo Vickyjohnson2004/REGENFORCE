@@ -26,9 +26,13 @@ import {
 const SEC_HISTORY_PAGES = (() => {
   const raw = Number(process.env.SEC_HISTORY_PAGES);
   if (Number.isFinite(raw) && raw > 0 && raw <= 100) return Math.trunc(raw);
-  return 15;
+  return 25;
 })();
-const SEC_ADMIN_HISTORY_PAGES = Math.min(10, SEC_HISTORY_PAGES);
+const SEC_ADMIN_HISTORY_PAGES = (() => {
+  const raw = Number(process.env.SEC_ADMIN_HISTORY_PAGES);
+  if (Number.isFinite(raw) && raw > 0 && raw <= 100) return Math.trunc(raw);
+  return 25;
+})();
 
 /**
  * SEC adapter: pulls from two RSS/Atom feeds and merges them:

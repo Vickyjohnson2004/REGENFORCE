@@ -28,7 +28,11 @@ import {
  */
 
 const OCC_API = "https://api.occ.gov/EnforcementActions/list";
-const OCC_KEYWORDS = ["bank", "national", "association", "federal", "savings", "company", "trust"];
+// One well-chosen broad keyword ("bank") returns ~5,900 records that cover
+// effectively all OCC-regulated entities (national banks, federal savings
+// associations, federal branches of foreign banks). Extra keywords only
+// marginally help and consume the DEMO_KEY rate limit (30 req/hour).
+const OCC_KEYWORDS = ["bank", "association"];
 const OCC_LOOKBACK_YEARS = 6;
 
 interface OccRecord {
@@ -50,35 +54,59 @@ interface OccRecord {
 
 export class OCCAdapter implements AgencyAdapter {
   readonly agency = "OCC" as const;
-  readonly runTimeoutMs = 90_000;
+  // Per-keyword request can return 5,000+ records and downloading plus JSON
+  // parse can take 30-60 seconds per call. Give the whole adapter 5 minutes.
+  readonly runTimeoutMs = 300_000;
 
   async fetchRecent(): Promise<AdapterRunResult> {
     const errors: AdapterRunResult["errors"] = [];
     const byDocket = new Map<string, OccRecord>();
     const apiKey = process.env.OCC_API_KEY ?? "DEMO_KEY";
+    const usingDemo = apiKey === "DEMO_KEY";
+
+    console.log(`[OCC] starting fetch, apiKey=${usingDemo ? "DEMO_KEY" : "custom"}, keywords=${OCC_KEYWORDS.join(",")}`);
 
     for (const keyword of OCC_KEYWORDS) {
       const url = `${OCC_API}/${encodeURIComponent(keyword)}?api_key=${apiKey}`;
+      const started = Date.now();
       try {
-        const rows = await fetchJson<OccRecord[]>(url, { timeoutMs: 30_000 });
-        if (!Array.isArray(rows)) continue;
+        const rows = await fetchJson<OccRecord[]>(url, { timeoutMs: 60_000 });
+        const elapsed = Date.now() - started;
+        if (!Array.isArray(rows)) {
+          console.log(`[OCC] keyword="${keyword}" returned non-array after ${elapsed}ms`);
+          continue;
+        }
+        let newThisBatch = 0;
         for (const row of rows) {
           const key = row.DocketNumber?.trim();
           if (!key) continue;
-          if (!byDocket.has(key)) byDocket.set(key, row);
+          if (!byDocket.has(key)) {
+            byDocket.set(key, row);
+            newThisBatch += 1;
+          }
         }
+        console.log(
+          `[OCC] keyword="${keyword}" returned ${rows.length} rows (+${newThisBatch} new) in ${elapsed}ms; total unique=${byDocket.size}`,
+        );
       } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.log(`[OCC] keyword="${keyword}" FAILED after ${Date.now() - started}ms: ${msg}`);
         errors.push({
-          message: `OCC API keyword "${keyword}": ${err instanceof Error ? err.message : String(err)}`,
-          hint: `URL: ${url.replace(apiKey, "***")}`,
+          message: `OCC API keyword "${keyword}": ${msg}`,
+          hint: `URL: ${url.replace(apiKey, "***")}. DEMO_KEY is rate-limited to 30 req/hour; set OCC_API_KEY for production.`,
         });
+        // If rate-limited (429) or auth-rejected (403), stop probing further
+        // keywords — more calls will only compound the error.
+        if (/HTTP 4(03|29)/i.test(msg)) break;
       }
     }
 
     if (byDocket.size === 0) {
       errors.push({
         message: "OCC API returned no records across all probe keywords",
-        hint: `Verify api.occ.gov/EnforcementActions/list/{keyword} is reachable from the deployment region. Without an API key the DEMO_KEY is rate-limited; set OCC_API_KEY env var for production.`,
+        hint: usingDemo
+          ? "OCC_API_KEY env var not set; using DEMO_KEY (30 req/hr limit). Request a free key at https://api.data.gov/signup/ and set OCC_API_KEY in Railway."
+          : "Verify api.occ.gov/EnforcementActions/list/{keyword} is reachable from the Railway deployment region.",
       });
       return { agency: "OCC", sourceUrl: OCC_API, actions: [], errors };
     }
