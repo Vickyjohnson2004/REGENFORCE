@@ -36,7 +36,13 @@ const SHARED_RULES: Rule[] = [
 
 const AGENCY_RULES: Record<Agency, Rule[]> = {
   SEC: [
+    // SEC adapter populates rawActionType from a sourceKey identifier such as
+    // `litigation_release` or `administrative_proceeding` — match those first
+    // so they don't fall through to the SHARED_RULES whitespace pattern.
+    { pattern: /\blitigation[_\s]release\b/i, canonical: "litigation" },
+    { pattern: /\badministrative[_\s]proceeding\b/i, canonical: "administrative_proceeding" },
     { pattern: /^LR-/, canonical: "litigation" },
+    { pattern: /\bLR-\d/i, canonical: "litigation" },
     { pattern: /34-/, canonical: "administrative_proceeding" },
     { pattern: /IA-/, canonical: "administrative_proceeding" },
     { pattern: /IC-/, canonical: "administrative_proceeding" },

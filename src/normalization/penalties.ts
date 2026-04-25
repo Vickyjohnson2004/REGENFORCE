@@ -13,7 +13,22 @@ import type { PenaltyComponent } from "../types.js";
  * If no amount is found, both are undefined. All amounts are USD-normalized.
  */
 
-const MONEY_RE = /\$\s?([\d,]+(?:\.\d+)?)\s*(million|mln|m|billion|bn|b|thousand|k)?\b/gi;
+// Require a `$` that is at the start of the string OR preceded by a
+// non-word character so we never match `$` glued to identifiers (e.g.
+// `case$48000`). The amount itself is digits with optional commas/decimal,
+// optionally followed by a unit suffix.
+const MONEY_RE = /(?:^|[^A-Za-z0-9$])\$\s?([\d,]+(?:\.\d+)?)\s*(million|mln|m|billion|bn|b|thousand|k)?\b/gi;
+
+// Sanity cap: any single penalty component above this is almost certainly a
+// false positive (an ID, a docket number, a mis-parsed phone number). The
+// largest known US financial-regulatory penalties are in the low single-digit
+// billions; Capital One's $480 BILLION figure observed in CFPB scraping is
+// the canonical false positive this catches.
+const MAX_REASONABLE_PENALTY_USD = 25_000_000_000; // $25B
+
+// Numbers this long without an explicit million/billion suffix are almost
+// always identifiers (docket/case numbers like 480000000000), not amounts.
+const MAX_DIGITS_WITHOUT_SUFFIX = 10;
 
 type Category = PenaltyComponent["type"];
 
@@ -27,16 +42,24 @@ const CATEGORY_MARKERS: { pattern: RegExp; category: Category }[] = [
 export function parsePenaltyAmount(rawAmount: string | number | null | undefined): number | undefined {
   if (rawAmount === null || rawAmount === undefined) return undefined;
   if (typeof rawAmount === "number") {
-    return Number.isFinite(rawAmount) ? rawAmount : undefined;
+    if (!Number.isFinite(rawAmount)) return undefined;
+    if (rawAmount > MAX_REASONABLE_PENALTY_USD) return undefined;
+    return rawAmount;
   }
   const trimmed = String(rawAmount).trim();
   if (!trimmed) return undefined;
-  const match = MONEY_RE.exec(trimmed.replace(/,/g, "")) ?? null;
+  const match = MONEY_RE.exec(trimmed) ?? null;
   MONEY_RE.lastIndex = 0;
   if (!match) return undefined;
-  const numeric = Number.parseFloat(match[1] ?? "");
+  const rawDigits = (match[1] ?? "").replace(/,/g, "");
+  const suffix = match[2];
+  const numeric = Number.parseFloat(rawDigits);
   if (!Number.isFinite(numeric)) return undefined;
-  return applyMultiplier(numeric, match[2]);
+  if (!suffix && rawDigits.length > MAX_DIGITS_WITHOUT_SUFFIX) return undefined;
+  const amount = applyMultiplier(numeric, suffix);
+  if (!Number.isFinite(amount) || amount <= 0) return undefined;
+  if (amount > MAX_REASONABLE_PENALTY_USD) return undefined;
+  return amount;
 }
 
 function applyMultiplier(value: number, suffix: string | undefined): number {
@@ -58,18 +81,33 @@ export interface PenaltyExtractResult {
 export function extractPenalty(text: string | null | undefined): PenaltyExtractResult {
   if (!text) return { currency: "USD", origin: "unknown" };
 
-  const cleaned = text.replace(/,/g, "");
+  // Keep commas in the source so we can detect grouped thousands (real money
+  // is usually written `$1,234,567` not `$1234567`); only strip commas inside
+  // the number itself when computing the numeric value.
   const components: PenaltyComponent[] = [];
-  const matches = Array.from(cleaned.matchAll(MONEY_RE));
+  const matches = Array.from(text.matchAll(MONEY_RE));
+  const seenAmounts = new Set<number>();
 
   for (const m of matches) {
-    const numeric = Number.parseFloat(m[1] ?? "");
+    const rawDigits = (m[1] ?? "").replace(/,/g, "");
+    const suffix = m[2];
+    const numeric = Number.parseFloat(rawDigits);
     if (!Number.isFinite(numeric)) continue;
-    const amount = applyMultiplier(numeric, m[2]);
+
+    if (!suffix && rawDigits.length > MAX_DIGITS_WITHOUT_SUFFIX) {
+      continue;
+    }
+
+    const amount = applyMultiplier(numeric, suffix);
+    if (!Number.isFinite(amount) || amount <= 0) continue;
+    if (amount > MAX_REASONABLE_PENALTY_USD) continue;
+
+    if (seenAmounts.has(amount)) continue;
+    seenAmounts.add(amount);
 
     const windowStart = Math.max(0, (m.index ?? 0) - 80);
-    const windowEnd = Math.min(cleaned.length, (m.index ?? 0) + 60);
-    const windowText = cleaned.slice(windowStart, windowEnd);
+    const windowEnd = Math.min(text.length, (m.index ?? 0) + 60);
+    const windowText = text.slice(windowStart, windowEnd);
 
     let category: Category = "other";
     for (const marker of CATEGORY_MARKERS) {
@@ -84,6 +122,9 @@ export function extractPenalty(text: string | null | undefined): PenaltyExtractR
   if (components.length === 0) return { currency: "USD", origin: "unknown" };
 
   const total = components.reduce((acc, c) => acc + c.amount, 0);
+  if (total > MAX_REASONABLE_PENALTY_USD) {
+    return { currency: "USD", origin: "unknown" };
+  }
   return {
     amount: total,
     currency: "USD",

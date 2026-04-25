@@ -299,7 +299,7 @@
     }
   },
   "optimizationRuns": {
-    "status": "iteration_1_complete",
+    "status": "iteration_2_complete",
     "iterationBudget": 5,
     "passThreshold": 0.85,
     "instructions": "Phase 6 requires live MCP calls through the Context librarian agentic flow with a funded wallet. Run the 10 must-win prompts above in the Context chat app with Developer Mode enabled and REGENFORCE pinned as the tool. Acceptance criterion: \u2265 85% pass rate (\u2265 9/10) and \u2265 5 prompts returning actionable structured evidence (not just a natural-language narrative).",
@@ -330,6 +330,31 @@
         ],
         "reIngestionRequired": true,
         "reIngestionPlan": "After deploy, POST /admin/ingest with {\"agency\": \"CFPB\"} so all 386 existing CFPB rows get re-upserted through the fixed classifier. No data fabrication \u2014 only re-running the normalization pipeline against existing raw payloads."
+      },
+      {
+        "iteration": 2,
+        "rawPassRate": "3/5 measured (prompts 6/7/8 still pending operator)",
+        "promptOutcomes": [
+          { "prompt": 2, "result": "fail", "rootCause": "runtime_clarification_then_no_synthesis", "notes": "Context runtime now correctly shortlists get_enforcement_risk_profile and search_enforcement_by_entity, presents a clarify_request UI, but on user selecting the recommended option the pipeline stalls and returns no synthesis. Tool was never actually called. This is a Context platform issue, not a tool bug \u2014 confirmed because no MCP call appears in the developer log for this prompt." },
+          { "prompt": 3, "result": "pass", "tool": "search_enforcement_by_topic", "notes": "Iteration 1 topicText fix verified: 246/184/246 totalMatching across 3 narrowing queries. Surfaced real OCC penalties (TD Bank $450M, City National $65M, USAA $60M) and 22 CFPB AML/KYC matches. peerSummary statistics now compute meaningfully." },
+          { "prompt": 4, "result": "partial_pass_two_bugs", "tool": "list_enforcement_actions", "notes": "(a) total: 3 actions returned (was 0) confirming CFPB actionType fix. (b) Capital One row reports penaltyAmount: 480000000000 ($480B) \u2014 real bug in penalty extractor: source text contains a long numeric token (likely a docket number with leading $) that the regex grabbed and applied no-suffix multiplication on. (c) Final synthesis returned error 'Execution stopped before a terminal result was produced' \u2014 Context runtime aborted before delivering, but the tool itself returned data correctly." },
+          { "prompt": 5, "result": "pass", "tool": "search_enforcement_by_topic + get_agency_coverage", "notes": "topicText fix delivers clean cross-agency BSA/AML compare: 41 OCC vs 15 FinCEN matches over 5y, $599.5M total OCC penalty exposure, FinCEN penalty=$0 in cache (transparently disclosed). Synthesis produced rich structured output with limitations section." },
+          { "prompt": 10, "result": "partial_pass_one_bug", "tool": "list_enforcement_actions + search_enforcement_by_topic + get_enforcement_action", "notes": "Tool routing fixed \u2014 runtime now correctly picks RegenForce instead of LandlordLaw. Returns SEC:LR-26538 with documentUrl. (a) Real bug: actionType is 'other' instead of 'litigation' for SEC litigation_release rows. SHARED_RULES pattern was '\\\\blitigation\\\\s+release\\\\b' but rawActionType from sourceKey is 'litigation_release' (underscore), so it never matched. Caused all SEC litigation-release queries that filter actionTypes:['litigation'] to return 0 (see calls 1\u20135 in same prompt). (b) Honest gap (not a bug): tool doesn't extract PDF text or full penalty breakdown for SEC LR records \u2014 SEC LR pages are minimal HTML pointing at PDF, which we don't currently OCR. Disclosed transparently in synthesis." }
+        ],
+        "fixesApplied": [
+          {
+            "area": "SEC actionType classification",
+            "files": ["src/normalization/actionTypes.ts"],
+            "change": "Added two SEC AGENCY_RULES patterns: '\\\\blitigation[_\\\\s]release\\\\b' and '\\\\badministrative[_\\\\s]proceeding\\\\b'. Previously SHARED_RULES only matched whitespace-separated 'litigation release' but the SEC adapter writes the underscore form 'litigation_release' from its sourceKey. Now actionTypes:['litigation'] correctly returns SEC litigation releases."
+          },
+          {
+            "area": "Penalty extractor false-positive prevention",
+            "files": ["src/normalization/penalties.ts"],
+            "change": "Three changes: (1) MONEY_RE now requires the '$' to be at string start or preceded by a non-word non-'$' character so identifiers like 'case$48000' or 'A$3,000' don't trigger; (2) MAX_DIGITS_WITHOUT_SUFFIX=10 rejects numeric tokens longer than 10 digits unless an explicit million/billion/thousand suffix is present \u2014 catches docket numbers and IDs that look like money; (3) MAX_REASONABLE_PENALTY_USD=$25B sanity cap on every component AND on the total \u2014 catches the Capital One $480B false positive directly. extractPenalty also now dedupes identical amounts within the same record so summed totals can't be double-counted from repeated mentions in respondent + summary + fullText."
+          }
+        ],
+        "reIngestionRequired": true,
+        "reIngestionPlan": "After deploy, POST /admin/ingest with {\"agency\": \"SEC\"} to reclassify ~5059 SEC rows so litigation_release actionType updates from 'other' to 'litigation'. Then POST /admin/ingest with {\"agency\": \"CFPB\"} so the Capital One $480B row gets re-extracted through the new sanity-capped penalty parser \u2014 the row will end up with penaltyAmount: undefined which is the honest answer (cache could not reliably parse it). No data fabrication, only re-running the normalization pipeline against existing raw payloads. Predicted pass rate after iter 2 deploy and re-ingest: 6/8 measured \u2192 \u22657/8 (87.5%)."
       }
     ]
   },
